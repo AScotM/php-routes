@@ -18,6 +18,7 @@ const MIN_CIDR_IPV6 = 0;
 const MAX_CIDR_IPV6 = 128;
 const MAX_CONNECTION_AGE = 3600;
 const MAX_PROCESS_SCAN_TIME = 30;
+const MAX_FILE_SIZE = 10485760;
 
 const TCP_STATES = [
     '01' => "ESTABLISHED",
@@ -109,9 +110,28 @@ class Security {
             throw new RuntimeException("/proc does not appear to be a valid proc filesystem");
         }
     }
+    
+    public static function validateInteger($value, int $min = null, int $max = null): int {
+        if (!is_numeric($value)) {
+            throw new InvalidArgumentException("Value must be numeric");
+        }
+        $intVal = (int)$value;
+        if ($min !== null && $intVal < $min) {
+            throw new InvalidArgumentException("Value must be at least $min");
+        }
+        if ($max !== null && $intVal > $max) {
+            throw new InvalidArgumentException("Value must be at most $max");
+        }
+        return $intVal;
+    }
+    
+    public static function sanitizeShellArgument(string $arg): string {
+        return escapeshellarg($arg);
+    }
 }
 
 class Config {
+    private static $config = [];
     private static $defaults = [
         'refresh_interval' => 2,
         'max_display_processes' => 10,
@@ -122,17 +142,41 @@ class Config {
         'rate_limit_requests' => 100,
         'rate_limit_window' => 60,
         'max_cache_size' => 10000,
-        'max_connections_per_scan' => 100000,
+        'max_connections_per_scan' => 50000,
         'socket_read_timeout' => 5,
         'enable_process_scan' => true,
     ];
     
     public static function get(string $key, $default = null) {
-        return $_ENV['TCP_MONITOR_' . strtoupper($key)] ?? self::$defaults[$key] ?? $default;
+        return $_ENV['TCP_MONITOR_' . strtoupper($key)] ?? self::$config[$key] ?? self::$defaults[$key] ?? $default;
     }
     
     public static function set(string $key, $value): void {
-        self::$defaults[$key] = $value;
+        self::$config[$key] = $value;
+    }
+    
+    public static function loadFromFile(string $file): void {
+        if (!file_exists($file)) {
+            throw new RuntimeException("Config file not found: $file");
+        }
+        
+        $content = file_get_contents($file);
+        $config = json_decode($content, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new RuntimeException("Invalid JSON in config file: " . json_last_error_msg());
+        }
+        
+        self::$config = array_merge(self::$defaults, $config);
+    }
+    
+    public static function validate(): void {
+        $required = ['refresh_interval', 'max_cache_size'];
+        foreach ($required as $key) {
+            if (!isset(self::$config[$key])) {
+                throw new RuntimeException("Missing required config: $key");
+            }
+        }
     }
 }
 
@@ -154,6 +198,10 @@ class RateLimiter {
         
         self::$requests[] = $now;
         return true;
+    }
+    
+    public static function getCurrentCount(): int {
+        return count(self::$requests);
     }
 }
 
@@ -269,6 +317,12 @@ class Logger {
 
 class ErrorHandler {
     public static function handleFileRead(string $file): string {
+        $fileSize = @filesize($file);
+        
+        if ($fileSize > MAX_FILE_SIZE) {
+            throw new RuntimeException("File $file is too large ($fileSize bytes)");
+        }
+        
         if (!Security::validatePath($file)) {
             throw new RuntimeException("Invalid file path: $file");
         }
@@ -301,14 +355,24 @@ class ErrorHandler {
             Logger::log($details, 'DEBUG');
         }
     }
+    
+    public static function handleShutdown(): void {
+        $error = error_get_last();
+        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+            $message = "Fatal error: {$error['message']} in {$error['file']} on line {$error['line']}";
+            fwrite(STDERR, $message . "\n");
+            Logger::log($message, 'FATAL');
+            
+            ProcessCache::clearCache();
+            ConnectionCache::clearCache();
+            ConnectionHistory::clearHistory();
+        }
+    }
 }
 
 class InputValidator {
     public static function validatePort($port): int {
-        if (!is_numeric($port) || $port < MIN_PORT || $port > MAX_PORT) {
-            throw new InvalidArgumentException("Port must be between " . MIN_PORT . " and " . MAX_PORT);
-        }
-        return (int)$port;
+        return Security::validateInteger($port, MIN_PORT, MAX_PORT);
     }
     
     public static function validateIpFilter(string $filter): string {
@@ -337,10 +401,7 @@ class InputValidator {
     }
     
     public static function validateInterval($interval): int {
-        if (!is_numeric($interval) || $interval < MIN_INTERVAL || $interval > MAX_INTERVAL) {
-            throw new InvalidArgumentException("Interval must be between " . MIN_INTERVAL . " and " . MAX_INTERVAL . " seconds");
-        }
-        return (int)$interval;
+        return Security::validateInteger($interval, MIN_INTERVAL, MAX_INTERVAL);
     }
     
     public static function validateOutputFile(string $file): string {
@@ -440,7 +501,7 @@ class ProcessCache {
                 $lineCount = 0;
                 while (($line = fgets($handle)) !== false) {
                     $lineCount++;
-                    if ($lineCount > Config::get('max_connections_per_scan', 100000)) {
+                    if ($lineCount > Config::get('max_connections_per_scan', 50000)) {
                         Logger::log("Reached max connections limit for $file", 'WARNING');
                         break;
                     }
@@ -465,24 +526,23 @@ class ProcessCache {
         
         if (!is_dir($fdPath)) return $foundInodes;
 
-        $fdDir = @opendir($fdPath);
-        if ($fdDir === false) return $foundInodes;
-
-        try {
-            while (($fd = readdir($fdDir)) !== false) {
-                if ($fd === '.' || $fd === '..') continue;
-
-                $link = @readlink($fdPath . '/' . $fd);
-                if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
-                    $inode = $matches[1];
-                    if (isset($targetInodes[$inode])) {
-                        $foundInodes[] = $inode;
+        $fds = @scandir($fdPath);
+        if ($fds === false) return $foundInodes;
+        
+        foreach ($fds as $fd) {
+            if ($fd === '.' || $fd === '..') continue;
+            
+            $link = @readlink($fdPath . '/' . $fd);
+            if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
+                $inode = $matches[1];
+                if (isset($targetInodes[$inode])) {
+                    $foundInodes[] = $inode;
+                    if (count($foundInodes) >= count($targetInodes)) {
+                        break;
                     }
                 }
-                PerformanceTracker::recordOperation('fd_scan');
             }
-        } finally {
-            closedir($fdDir);
+            PerformanceTracker::recordOperation('fd_scan');
         }
         
         return $foundInodes;
@@ -592,6 +652,8 @@ class ConnectionCache {
     private static $cache = [];
     
     public static function getConnections(string $file, int $family, bool $includeProcess = false): array {
+        $maxConnections = Config::get('max_connections_per_scan', 50000);
+        
         $key = $file . '_' . $family . '_' . (int)$includeProcess;
         
         $fileHash = self::getFileHash($file);
@@ -599,10 +661,17 @@ class ConnectionCache {
         
         $cacheKey = $key . '_' . $fileHash;
         
-        if (!isset(self::$cache[$cacheKey]) || (time() - self::$cache[$cacheKey]['timestamp']) > Config::get('connection_cache_ttl')) {
+        if (!isset(self::$cache[$cacheKey]) || self::isCacheExpired($cacheKey)) {
             PerformanceTracker::startTimer("read_connections_$family");
+            $connections = self::readConnections($file, $family, $includeProcess);
+            
+            if (count($connections) > $maxConnections) {
+                $connections = array_slice($connections, 0, $maxConnections);
+                Logger::log("Limited connections to $maxConnections for $file", 'WARNING');
+            }
+            
             self::$cache[$cacheKey] = [
-                'data' => self::readConnections($file, $family, $includeProcess),
+                'data' => $connections,
                 'timestamp' => time()
             ];
             PerformanceTracker::stopTimer("read_connections_$family");
@@ -610,6 +679,10 @@ class ConnectionCache {
         }
         
         return self::$cache[$cacheKey]['data'];
+    }
+    
+    private static function isCacheExpired(string $cacheKey): bool {
+        return (time() - self::$cache[$cacheKey]['timestamp']) > Config::get('connection_cache_ttl');
     }
     
     private static function getFileHash(string $file): ?string {
@@ -651,7 +724,7 @@ class ConnectionCache {
         try {
             while (($line = fgets($handle)) !== false) {
                 $lineCount++;
-                if ($lineCount > Config::get('max_connections_per_scan', 100000)) {
+                if ($lineCount > Config::get('max_connections_per_scan', 50000)) {
                     Logger::log("Reached max connections limit for $file", 'WARNING');
                     break;
                 }
@@ -1364,17 +1437,6 @@ class Application {
     }
 }
 
-register_shutdown_function(function() {
-    $error = error_get_last();
-    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-        $message = "Fatal error: {$error['message']} in {$error['file']} on line {$error['line']}";
-        fwrite(STDERR, $message . "\n");
-        Logger::log($message, 'FATAL');
-    }
-    
-    ProcessCache::clearCache();
-    ConnectionCache::clearCache();
-    ConnectionHistory::clearHistory();
-});
+register_shutdown_function([ErrorHandler::class, 'handleShutdown']);
 
 Application::run();
