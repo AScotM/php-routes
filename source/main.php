@@ -1,10 +1,12 @@
 #!/usr/bin/php
 <?php
 
-defined('AF_INET')  || define('AF_INET', 2);
-defined('AF_INET6') || define('AF_INET6', 10);
-defined('JSON_INVALID_UTF8_SUBSTITUTE') || define('JSON_INVALID_UTF8_SUBSTITUTE', 0);
-defined('SOCKET_READ_TIMEOUT') || define('SOCKET_READ_TIMEOUT', 5);
+declare(strict_types=1);
+
+if (!defined('AF_INET')) define('AF_INET', 2);
+if (!defined('AF_INET6')) define('AF_INET6', 10);
+if (!defined('SOCKET_READ_TIMEOUT')) define('SOCKET_READ_TIMEOUT', 5);
+if (!defined('JSON_INVALID_UTF8_SUBSTITUTE')) define('JSON_INVALID_UTF8_SUBSTITUTE', 128);
 
 const IPV4_HEX_LENGTH = 8;
 const IPV6_HEX_LENGTH = 32;
@@ -22,6 +24,7 @@ const MAX_FILE_SIZE = 10485760;
 const MEMORY_WARNING_THRESHOLD = 256 * 1024 * 1024;
 const MEMORY_CRITICAL_THRESHOLD = 384 * 1024 * 1024;
 const MAX_PID = 4194304;
+const MAX_CACHE_ENTRIES = 10000;
 
 const TCP_STATES = [
     '01' => "ESTABLISHED",
@@ -51,22 +54,24 @@ const COLORS = [
     'reset' => "\033[0m"
 ];
 
-class Security {
-    public static function sanitizeOutput($data) {
-        if (!is_string($data)) return $data;
-        return htmlspecialchars($data, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+final class Security {
+    public static function sanitizeOutput($data): string {
+        if (!is_string($data)) {
+            return (string)$data;
+        }
+        return htmlspecialchars($data, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML5, 'UTF-8');
     }
     
-    public static function validatePath($path): bool {
+    public static function validatePath(string $path): bool {
         $normalizedPath = self::normalizePath($path);
         
-        if (strpos($normalizedPath, '/proc/') !== 0) {
-            Logger::log("Path validation failed: $normalizedPath is not under /proc", 'DEBUG');
+        if (!str_starts_with($normalizedPath, '/proc/')) {
+            Logger::debug("Path validation failed: $normalizedPath is not under /proc");
             return false;
         }
         
-        if (preg_match('/\.\./', $normalizedPath)) {
-            Logger::log("Path validation failed: $normalizedPath contains parent directory reference", 'DEBUG');
+        if (str_contains($normalizedPath, '..')) {
+            Logger::debug("Path validation failed: $normalizedPath contains parent directory reference");
             return false;
         }
         
@@ -85,12 +90,17 @@ class Security {
             }
         }
         
-        Logger::log("Path validation failed: $normalizedPath does not match allowed patterns", 'DEBUG');
+        Logger::debug("Path validation failed: $normalizedPath does not match allowed patterns");
         return false;
     }
     
     private static function normalizePath(string $path): string {
-        if (strpos($path, '/') !== 0) {
+        $path = trim($path);
+        if ($path === '') {
+            return '/';
+        }
+        
+        if ($path[0] !== '/') {
             $path = '/' . $path;
         }
         
@@ -110,19 +120,20 @@ class Security {
     }
     
     public static function validateProcFilesystem(): void {
-        if (!file_exists('/proc') || !is_dir('/proc')) {
+        if (!is_dir('/proc')) {
             throw new RuntimeException("/proc directory does not exist or is not accessible");
         }
         
-        if (!file_exists('/proc/self') && !file_exists('/proc/version')) {
+        if (!is_readable('/proc/self') && !is_readable('/proc/version')) {
             throw new RuntimeException("/proc does not appear to be a valid proc filesystem");
         }
     }
     
-    public static function validateInteger($value, int $min = null, int $max = null): int {
+    public static function validateInteger($value, ?int $min = null, ?int $max = null): int {
         if (!is_numeric($value)) {
             throw new InvalidArgumentException("Value must be numeric");
         }
+        
         $intVal = (int)$value;
         if ($min !== null && $intVal < $min) {
             throw new InvalidArgumentException("Value must be at least $min");
@@ -130,21 +141,27 @@ class Security {
         if ($max !== null && $intVal > $max) {
             throw new InvalidArgumentException("Value must be at most $max");
         }
+        
         return $intVal;
-    }
-    
-    public static function sanitizeShellArgument(string $arg): string {
-        return escapeshellarg($arg);
     }
     
     public static function validatePid(int $pid): bool {
         return $pid > 0 && $pid <= MAX_PID;
     }
+    
+    public static function createTempFile(string $prefix, string $directory = null): string {
+        $directory = $directory ?: sys_get_temp_dir();
+        $tempFile = tempnam($directory, $prefix);
+        if ($tempFile === false) {
+            throw new RuntimeException("Failed to create temporary file");
+        }
+        return $tempFile;
+    }
 }
 
-class Config {
-    private static $config = [];
-    private static $defaults = [
+final class Config {
+    private static array $config = [];
+    private static array $defaults = [
         'refresh_interval' => 2,
         'max_display_processes' => 10,
         'process_cache_ttl' => 5,
@@ -157,25 +174,51 @@ class Config {
         'max_connections_per_scan' => 50000,
         'socket_read_timeout' => 5,
         'enable_process_scan' => true,
+        'log_level' => 'INFO',
     ];
     
     public static function get(string $key, $default = null) {
         $envKey = 'TCP_MONITOR_' . strtoupper($key);
         
         if (isset($_ENV[$envKey])) {
-            return $_ENV[$envKey];
+            return self::castValue($_ENV[$envKey], $key);
         }
         
         return self::$config[$key] ?? self::$defaults[$key] ?? $default;
     }
     
     public static function set(string $key, $value): void {
+        if (isset(self::$defaults[$key])) {
+            $value = self::castValue($value, $key);
+        }
         self::$config[$key] = $value;
     }
     
+    private static function castValue($value, string $key) {
+        if (!isset(self::$defaults[$key])) {
+            return $value;
+        }
+        
+        $default = self::$defaults[$key];
+        $type = gettype($default);
+        
+        switch ($type) {
+            case 'integer':
+                return (int)$value;
+            case 'boolean':
+                return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+            case 'double':
+                return (float)$value;
+            case 'string':
+                return (string)$value;
+            default:
+                return $value;
+        }
+    }
+    
     public static function loadFromFile(string $file): void {
-        if (!file_exists($file)) {
-            throw new RuntimeException("Config file not found: $file");
+        if (!is_file($file) || !is_readable($file)) {
+            throw new RuntimeException("Config file not found or not readable: $file");
         }
         
         $content = file_get_contents($file);
@@ -183,49 +226,50 @@ class Config {
             throw new RuntimeException("Cannot read config file: $file");
         }
         
-        $config = json_decode($content, true);
+        $config = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
         
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new RuntimeException("Invalid JSON in config file: " . json_last_error_msg());
+        if (!is_array($config)) {
+            throw new RuntimeException("Invalid JSON structure in config file");
         }
         
         self::$config = array_merge(self::$defaults, $config);
-        self::validateLoadedConfig();
-    }
-    
-    private static function validateLoadedConfig(): void {
-        foreach (self::$config as $key => $value) {
-            if (isset(self::$defaults[$key])) {
-                $defaultType = gettype(self::$defaults[$key]);
-                if (gettype($value) !== $defaultType) {
-                    throw new RuntimeException("Config value for '$key' has wrong type. Expected $defaultType, got " . gettype($value));
-                }
-            }
-        }
-    }
-    
-    public static function validate(): void {
-        $required = ['refresh_interval', 'max_cache_size'];
-        foreach ($required as $key) {
-            if (!isset(self::$config[$key])) {
-                throw new RuntimeException("Missing required config: $key");
-            }
-        }
     }
     
     public static function loadFromEnv(): void {
         foreach ($_ENV as $key => $value) {
-            if (strpos($key, 'TCP_MONITOR_') === 0) {
+            if (str_starts_with($key, 'TCP_MONITOR_')) {
                 $configKey = strtolower(substr($key, 12));
-                self::$config[$configKey] = $value;
+                self::set($configKey, $value);
+            }
+        }
+    }
+    
+    public static function loadFromEnvFile(string $file): void {
+        if (!is_file($file) || !is_readable($file)) {
+            throw new RuntimeException("Environment file not found: $file");
+        }
+        
+        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#') continue;
+            
+            if (str_contains($line, '=')) {
+                list($key, $value) = explode('=', $line, 2);
+                $key = trim($key);
+                $value = trim($value);
+                
+                if (str_starts_with($key, 'TCP_MONITOR_')) {
+                    $_ENV[$key] = $value;
+                }
             }
         }
     }
 }
 
-class RateLimiter {
-    private static $requests = [];
-    private static $lastCleanup = 0;
+final class RateLimiter {
+    private static array $requests = [];
+    private static int $lastCleanup = 0;
     
     public static function checkLimit(): bool {
         $maxRequests = Config::get('rate_limit_requests', 100);
@@ -246,9 +290,7 @@ class RateLimiter {
     }
     
     private static function cleanupOldRequests(int $now, int $window): void {
-        self::$requests = array_filter(self::$requests, function($time) use ($now, $window) {
-            return $time > $now - $window;
-        });
+        self::$requests = array_filter(self::$requests, fn($time) => $time > $now - $window);
     }
     
     public static function getCurrentCount(): int {
@@ -256,25 +298,32 @@ class RateLimiter {
     }
 }
 
-class PerformanceTracker {
-    private static $startTime;
-    private static $memoryPeak = 0;
-    private static $operations = 0;
-    private static $memoryChecks = [];
-    private static $timers = [];
-    private static $gcTriggered = false;
+final class PerformanceTracker {
+    private static float $startTime;
+    private static int $memoryPeak = 0;
+    private static int $operations = 0;
+    private static array $memoryChecks = [];
+    private static array $timers = [];
+    private static bool $gcTriggered = false;
+    private static int $lastCheck = 0;
 
     public static function start(): void {
         self::$startTime = microtime(true);
         self::$memoryPeak = memory_get_peak_usage(true);
+        self::$lastCheck = time();
     }
 
     public static function recordOperation(string $type = 'general'): void {
         self::$operations++;
-        self::checkMemoryUsage();
+        
+        $now = time();
+        if ($now - self::$lastCheck >= 1) {
+            self::checkMemoryUsage();
+            self::$lastCheck = $now;
+        }
         
         if (!isset(self::$timers[$type])) {
-            self::$timers[$type] = ['count' => 0, 'time' => 0];
+            self::$timers[$type] = ['count' => 0, 'time' => 0.0];
         }
         self::$timers[$type]['count']++;
     }
@@ -287,12 +336,11 @@ class PerformanceTracker {
         if (isset(self::$timers[$name]['start'])) {
             $duration = microtime(true) - self::$timers[$name]['start'];
             if (!isset(self::$timers[$name]['total'])) {
-                self::$timers[$name]['total'] = 0;
+                self::$timers[$name]['total'] = 0.0;
                 self::$timers[$name]['count'] = 0;
             }
-            self::$timers[$name]['total'] += $duration;
-            self::$timers[$name]['count']++;
-            self::$timers[$name]['average'] = self::$timers[$name]['total'] / self::$timers[$name]['count'];
+            self::$timers[$type]['total'] += $duration;
+            self::$timers[$type]['count']++;
         }
     }
 
@@ -305,11 +353,11 @@ class PerformanceTracker {
         }
         
         if ($currentMemory > MEMORY_CRITICAL_THRESHOLD && !self::$gcTriggered) {
-            Logger::log("Critical memory usage: " . round($currentMemory/1024/1024, 2) . "MB", 'ERROR');
+            Logger::error("Critical memory usage: " . round($currentMemory/1024/1024, 2) . "MB");
             gc_collect_cycles();
             self::$gcTriggered = true;
         } elseif ($currentMemory > MEMORY_WARNING_THRESHOLD && !self::$gcTriggered) {
-            Logger::log("High memory usage: " . round($currentMemory/1024/1024, 2) . "MB", 'WARNING');
+            Logger::warning("High memory usage: " . round($currentMemory/1024/1024, 2) . "MB");
         } elseif ($currentMemory <= MEMORY_WARNING_THRESHOLD) {
             self::$gcTriggered = false;
         }
@@ -325,22 +373,33 @@ class PerformanceTracker {
         }
         
         if ($currentMemory > 512 * 1024 * 1024) {
+            Logger::fatal("Emergency shutdown due to memory usage: " . round($currentMemory/1024/1024, 2) . "MB");
             fwrite(STDERR, "Emergency shutdown: Memory usage too high\n");
-            Logger::log("Emergency shutdown due to memory usage: " . round($currentMemory/1024/1024, 2) . "MB", 'FATAL');
             exit(1);
         }
     }
 
     public static function getMetrics(): array {
         $endTime = microtime(true);
-        return [
+        $metrics = [
             'execution_time' => round($endTime - self::$startTime, 4),
             'memory_peak_mb' => round(self::$memoryPeak / 1024 / 1024, 2),
             'operations' => self::$operations,
             'memory_checks' => count(self::$memoryChecks),
-            'timers' => self::$timers,
             'timestamp' => date('c')
         ];
+        
+        foreach (self::$timers as $name => $timer) {
+            if (isset($timer['total'])) {
+                $metrics['timers'][$name] = [
+                    'total' => round($timer['total'], 4),
+                    'count' => $timer['count'],
+                    'average' => round($timer['total'] / $timer['count'], 4)
+                ];
+            }
+        }
+        
+        return $metrics;
     }
     
     public static function reset(): void {
@@ -349,36 +408,46 @@ class PerformanceTracker {
         self::$memoryChecks = [];
         self::$timers = [];
         self::$gcTriggered = false;
+        self::$lastCheck = time();
     }
 }
 
-class Logger {
-    private static $logFile = null;
-    private static $logLevel = 'INFO';
-    private static $levels = ['DEBUG' => 0, 'INFO' => 1, 'WARNING' => 2, 'ERROR' => 3, 'FATAL' => 4];
-    private static $logBuffer = [];
-    private static $bufferSize = 100;
+final class Logger {
+    private static ?string $logFile = null;
+    private static string $logLevel = 'INFO';
+    private static array $levels = ['DEBUG' => 0, 'INFO' => 1, 'WARNING' => 2, 'ERROR' => 3, 'FATAL' => 4];
+    private static array $logBuffer = [];
+    private const BUFFER_SIZE = 100;
     
     public static function setLogLevel(string $level): void {
+        $level = strtoupper($level);
         if (isset(self::$levels[$level])) {
             self::$logLevel = $level;
         }
     }
     
     public static function log(string $message, string $level = 'INFO'): void {
-        if (self::$levels[$level] < self::$levels[self::$logLevel]) {
+        $level = strtoupper($level);
+        
+        if (!isset(self::$levels[$level]) || self::$levels[$level] < self::$levels[self::$logLevel]) {
             return;
         }
         
         $timestamp = date('Y-m-d H:i:s');
-        $logEntry = "[$timestamp] [$level] $message\n";
+        $logEntry = sprintf("[%s] [%s] %s\n", $timestamp, $level, trim($message));
         
         self::$logBuffer[] = $logEntry;
         
-        if (count(self::$logBuffer) >= self::$bufferSize) {
+        if (count(self::$logBuffer) >= self::BUFFER_SIZE) {
             self::flushBuffer();
         }
     }
+    
+    public static function debug(string $message): void { self::log($message, 'DEBUG'); }
+    public static function info(string $message): void { self::log($message, 'INFO'); }
+    public static function warning(string $message): void { self::log($message, 'WARNING'); }
+    public static function error(string $message): void { self::log($message, 'ERROR'); }
+    public static function fatal(string $message): void { self::log($message, 'FATAL'); }
     
     private static function flushBuffer(): void {
         if (empty(self::$logBuffer)) {
@@ -388,9 +457,15 @@ class Logger {
         $logContent = implode('', self::$logBuffer);
         
         if (self::$logFile) {
-            file_put_contents(self::$logFile, $logContent, FILE_APPEND | LOCK_EX);
+            if (file_put_contents(self::$logFile, $logContent, FILE_APPEND | LOCK_EX) === false) {
+                fwrite(STDERR, "Failed to write to log file: " . self::$logFile . "\n");
+            }
         } else {
-            fwrite(STDERR, $logContent);
+            if ($level === 'ERROR' || $level === 'FATAL') {
+                fwrite(STDERR, $logContent);
+            } else {
+                fwrite(STDOUT, $logContent);
+            }
         }
         
         self::$logBuffer = [];
@@ -398,8 +473,8 @@ class Logger {
     
     public static function setLogFile(string $file): void {
         $dir = dirname($file);
-        if (!is_writable($dir) && !is_writable($file)) {
-            throw new RuntimeException("Log directory is not writable: " . $dir);
+        if (!is_dir($dir) || !is_writable($dir)) {
+            throw new RuntimeException("Log directory is not writable: $dir");
         }
         self::$logFile = $file;
         self::flushBuffer();
@@ -410,27 +485,26 @@ class Logger {
     }
 }
 
-class ErrorHandler {
+final class ErrorHandler {
     public static function handleFileRead(string $file): string {
         if (!Security::validatePath($file)) {
             throw new RuntimeException("Security violation: Invalid file path '$file'");
         }
         
-        $fileSize = @filesize($file);
+        if (!is_file($file) || !is_readable($file)) {
+            throw new RuntimeException("File $file does not exist or is not readable");
+        }
+        
+        $fileSize = filesize($file);
+        if ($fileSize === false) {
+            throw new RuntimeException("Cannot determine size of file: $file");
+        }
         
         if ($fileSize > MAX_FILE_SIZE) {
             throw new RuntimeException("File $file is too large ($fileSize bytes)");
         }
         
-        if (!file_exists($file)) {
-            throw new RuntimeException("File $file does not exist");
-        }
-        
-        if (!is_readable($file)) {
-            throw new RuntimeException("File $file is not readable");
-        }
-        
-        $content = @file_get_contents($file);
+        $content = file_get_contents($file);
         if ($content === false) {
             $error = error_get_last();
             throw new RuntimeException("Failed to read $file: " . ($error['message'] ?? 'Unknown error'));
@@ -439,15 +513,22 @@ class ErrorHandler {
         return $content;
     }
     
-    public static function handle(Exception $e, bool $verbose = false): void {
+    public static function handle(Throwable $e, bool $verbose = false): void {
         $message = "Error: " . Security::sanitizeOutput($e->getMessage());
         fwrite(STDERR, $message . "\n");
-        Logger::log($message, 'ERROR');
+        Logger::error($message);
         
         if ($verbose) {
-            $details = "File: " . Security::sanitizeOutput($e->getFile()) . " Line: " . Security::sanitizeOutput($e->getLine());
+            $details = sprintf("File: %s Line: %d", 
+                Security::sanitizeOutput($e->getFile()), 
+                $e->getLine()
+            );
             fwrite(STDERR, $details . "\n");
-            Logger::log($details, 'DEBUG');
+            Logger::debug($details);
+            
+            if ($e->getPrevious()) {
+                Logger::debug("Previous: " . $e->getPrevious()->getMessage());
+            }
         }
     }
     
@@ -455,10 +536,14 @@ class ErrorHandler {
         Logger::shutdown();
         
         $error = error_get_last();
-        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-            $message = "Fatal error: {$error['message']} in {$error['file']} on line {$error['line']}";
+        if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+            $message = sprintf("Fatal error: %s in %s on line %d",
+                $error['message'],
+                $error['file'],
+                $error['line']
+            );
             fwrite(STDERR, $message . "\n");
-            Logger::log($message, 'FATAL');
+            Logger::fatal($message);
             
             ProcessCache::clearCache();
             ConnectionCache::clearCache();
@@ -467,7 +552,7 @@ class ErrorHandler {
     }
 }
 
-class InputValidator {
+final class InputValidator {
     public static function validatePort($port): int {
         return Security::validateInteger($port, MIN_PORT, MAX_PORT);
     }
@@ -480,8 +565,14 @@ class InputValidator {
     }
     
     private static function isValidIpOrCidr(string $input): bool {
-        if (strpos($input, '/') !== false) {
-            list($ip, $mask) = explode('/', $input, 2);
+        $input = trim($input);
+        if ($input === '') return false;
+        
+        if (str_contains($input, '/')) {
+            $parts = explode('/', $input, 2);
+            if (count($parts) !== 2) return false;
+            
+            list($ip, $mask) = $parts;
             if (!is_numeric($mask)) return false;
             
             $mask = (int)$mask;
@@ -503,9 +594,16 @@ class InputValidator {
     
     public static function validateOutputFile(string $file): string {
         $dir = dirname($file);
-        if (!is_writable($dir) && !is_writable($file)) {
+        if ($dir !== '' && !is_dir($dir)) {
+            if (!mkdir($dir, 0755, true)) {
+                throw new InvalidArgumentException("Cannot create output directory: $dir");
+            }
+        }
+        
+        if ($dir !== '' && !is_writable($dir)) {
             throw new InvalidArgumentException("Output directory is not writable: $dir");
         }
+        
         return $file;
     }
     
@@ -514,20 +612,28 @@ class InputValidator {
     }
 }
 
-class ProcessCache {
-    private static $cache = [];
-    private static $lastBuild = 0;
-    private static $scanStartTime = 0;
-    private static $building = false;
-    private static $connectionInodes = null;
+final class ProcessCache {
+    private static array $cache = [];
+    private static int $lastBuild = 0;
+    private static int $scanStartTime = 0;
+    private static bool $building = false;
+    private static ?array $connectionInodes = null;
+    private static int $hits = 0;
+    private static int $misses = 0;
 
     public static function getProcessMap(): array {
         $now = time();
-        if (empty(self::$cache) || ($now - self::$lastBuild) > Config::get('process_cache_ttl')) {
+        $ttl = Config::get('process_cache_ttl', 5);
+        
+        if (empty(self::$cache) || ($now - self::$lastBuild) > $ttl) {
+            self::$misses++;
             self::$cache = self::buildProcessMap();
             self::$lastBuild = $now;
             self::enforceCacheLimits();
+        } else {
+            self::$hits++;
         }
+        
         return self::$cache;
     }
 
@@ -537,7 +643,7 @@ class ProcessCache {
         }
         
         if (self::$building) {
-            Logger::log("Process map already being built, returning empty", 'DEBUG');
+            Logger::debug("Process map already being built, returning empty");
             return [];
         }
         
@@ -550,12 +656,12 @@ class ProcessCache {
             self::$connectionInodes = self::extractInodesFromProcNet();
             
             if (empty(self::$connectionInodes)) {
-                Logger::log("No inodes found in /proc/net files");
+                Logger::info("No inodes found in /proc/net files");
                 return $processMap;
             }
 
             self::$scanStartTime = time();
-            $procDir = @opendir('/proc');
+            $procDir = opendir('/proc');
             if ($procDir === false) {
                 throw new RuntimeException("Cannot open /proc directory");
             }
@@ -565,7 +671,7 @@ class ProcessCache {
                     if (!ctype_digit($entry)) continue;
                     
                     if ((time() - self::$scanStartTime) > MAX_PROCESS_SCAN_TIME) {
-                        Logger::log("Process scan timeout after " . MAX_PROCESS_SCAN_TIME . " seconds", 'WARNING');
+                        Logger::warning("Process scan timeout after " . MAX_PROCESS_SCAN_TIME . " seconds");
                         break;
                     }
 
@@ -574,7 +680,7 @@ class ProcessCache {
 
                     if (!is_dir($processDir)) continue;
 
-                    $foundInodes = self::scanProcessInodes($pid, self::$connectionInodes);
+                    $foundInodes = self::scanProcessInodes($pid);
                     if (!empty($foundInodes)) {
                         $processName = self::getProcessName($pid);
                         foreach ($foundInodes as $inode) {
@@ -582,6 +688,7 @@ class ProcessCache {
                         }
                         
                         if (count($processMap) >= count(self::$connectionInodes)) {
+                            Logger::debug("Found all inodes, stopping scan early");
                             break;
                         }
                     }
@@ -592,7 +699,8 @@ class ProcessCache {
                 closedir($procDir);
             }
             
-            Logger::log("Built process map with " . count($processMap) . " entries in " . (time() - self::$scanStartTime) . "s");
+            $duration = time() - self::$scanStartTime;
+            Logger::info(sprintf("Built process map with %d entries in %ds", count($processMap), $duration));
             return $processMap;
         } finally {
             self::$building = false;
@@ -612,27 +720,32 @@ class ProcessCache {
             if (!file_exists($file)) continue;
             
             PerformanceTracker::startTimer("read_$file");
-            $handle = @fopen($file, 'r');
-            if ($handle === false) continue;
             
             try {
+                $handle = fopen($file, 'r');
+                if ($handle === false) continue;
+                
                 $lineCount = 0;
                 $maxConnections = Config::get('max_connections_per_scan', 50000);
                 
                 while (($line = fgets($handle)) !== false) {
                     $lineCount++;
                     if ($lineCount > $maxConnections) {
-                        Logger::log("Reached max connections limit for $file at line $lineCount", 'WARNING');
+                        Logger::warning("Reached max connections limit for $file at line $lineCount");
                         break;
                     }
                     
-                    if (preg_match('/\s+\d+:\s+[0-9A-F:]+\\s+[0-9A-F:]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+[0-9A-F]+\\s+(\d+)/', $line, $matches)) {
+                    if (preg_match('/\s+(\d+)$/', $line, $matches)) {
                         $inodes[$matches[1]] = true;
                     }
                     PerformanceTracker::recordOperation('inode_extraction');
                 }
+            } catch (Throwable $e) {
+                Logger::error("Error reading $file: " . $e->getMessage());
             } finally {
-                fclose($handle);
+                if (isset($handle) && is_resource($handle)) {
+                    fclose($handle);
+                }
                 PerformanceTracker::stopTimer("read_$file");
             }
         }
@@ -640,24 +753,25 @@ class ProcessCache {
         return $inodes;
     }
     
-    private static function scanProcessInodes(int $pid, array $targetInodes): array {
+    private static function scanProcessInodes(int $pid): array {
         $foundInodes = [];
         $fdPath = "/proc/{$pid}/fd";
         
         if (!is_dir($fdPath)) return $foundInodes;
 
-        $fds = @scandir($fdPath);
+        $fds = scandir($fdPath);
         if ($fds === false) return $foundInodes;
         
         foreach ($fds as $fd) {
             if ($fd === '.' || $fd === '..') continue;
             
-            $link = @readlink($fdPath . '/' . $fd);
+            $linkPath = $fdPath . '/' . $fd;
+            $link = readlink($linkPath);
             if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
                 $inode = $matches[1];
-                if (isset($targetInodes[$inode])) {
+                if (isset(self::$connectionInodes[$inode])) {
                     $foundInodes[] = $inode;
-                    if (count($foundInodes) >= count($targetInodes)) {
+                    if (count($foundInodes) >= count(self::$connectionInodes)) {
                         break;
                     }
                 }
@@ -670,31 +784,54 @@ class ProcessCache {
     
     private static function getProcessName(int $pid): string {
         $commPath = "/proc/{$pid}/comm";
-        $processName = @file_get_contents($commPath);
-        return $processName ? trim($processName) . " (PID: $pid)" : "PID: $pid";
+        if (!is_readable($commPath)) {
+            return "PID: $pid";
+        }
+        
+        $processName = file_get_contents($commPath);
+        if ($processName === false) {
+            return "PID: $pid";
+        }
+        
+        return trim($processName) . " (PID: $pid)";
     }
     
     private static function enforceCacheLimits(): void {
-        $maxSize = Config::get('max_cache_size', 10000);
+        $maxSize = Config::get('max_cache_size', MAX_CACHE_ENTRIES);
         if (count(self::$cache) > $maxSize) {
             self::$cache = array_slice(self::$cache, -$maxSize, null, true);
-            Logger::log("Process cache trimmed to $maxSize entries");
+            Logger::info("Process cache trimmed to $maxSize entries");
         }
     }
     
     public static function clearCache(): void {
         self::$cache = [];
         self::$lastBuild = 0;
+        self::$hits = 0;
+        self::$misses = 0;
     }
     
     public static function disableProcessScan(): void {
         Config::set('enable_process_scan', false);
     }
+    
+    public static function getStats(): array {
+        return [
+            'cache_size' => count(self::$cache),
+            'hits' => self::$hits,
+            'misses' => self::$misses,
+            'hit_rate' => (self::$hits + self::$misses) > 0 ? 
+                round(self::$hits / (self::$hits + self::$misses) * 100, 2) : 0
+        ];
+    }
 }
 
-class IPUtils {
+final class IPUtils {
     public static function hexToIpv4(string $hex): string {
-        if (strlen($hex) !== IPV4_HEX_LENGTH) return '0.0.0.0';
+        $hex = preg_replace('/[^0-9A-Fa-f]/', '', $hex);
+        if (strlen($hex) !== IPV4_HEX_LENGTH) {
+            return '0.0.0.0';
+        }
 
         $parts = [];
         for ($i = 0; $i < IPV4_HEX_LENGTH; $i += 2) {
@@ -706,18 +843,34 @@ class IPUtils {
 
     public static function hexToIpv6(string $hex): string {
         $hex = preg_replace('/[^0-9A-Fa-f]/', '', $hex);
-        if (strlen($hex) !== IPV6_HEX_LENGTH) return '::';
+        if (strlen($hex) !== IPV6_HEX_LENGTH) {
+            return '::';
+        }
 
         $blocks = str_split($hex, 8);
         $blocks = array_reverse($blocks);
         $reordered = implode('', $blocks);
+        
         $packed = pack('H*', $reordered);
-        $addr = @inet_ntop($packed);
+        if ($packed === false) {
+            return '::';
+        }
+        
+        $addr = inet_ntop($packed);
         return $addr ?: '::';
     }
 
     public static function ipInCidr(string $ip, string $cidr): bool {
-        list($subnet, $mask) = explode('/', $cidr);
+        $parts = explode('/', $cidr, 2);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        
+        list($subnet, $mask) = $parts;
+        if (!is_numeric($mask)) {
+            return false;
+        }
+        
         $mask = (int)$mask;
 
         if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -740,13 +893,8 @@ class IPUtils {
 
         if ($ipLong === false || $subnetLong === false) return false;
 
-        if (PHP_INT_SIZE === 4) {
-            $maskLong = ($mask === 0) ? 0 : (0xFFFFFFFF << (32 - $mask));
-            return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
-        } else {
-            $maskLong = ($mask === 0) ? 0 : ((0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF);
-            return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
-        }
+        $maskLong = ($mask === 0) ? 0 : ((0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF);
+        return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
     }
 
     private static function ipv6InCidr(string $ip, string $subnet, int $mask): bool {
@@ -755,20 +903,26 @@ class IPUtils {
 
         if ($ipBin === false || $subnetBin === false) return false;
         if ($mask === 0) return true;
+        if ($mask >= 128) return $ip === $subnet;
 
-        $binMask = str_repeat('f', intval(floor($mask / 4)));
+        $binMask = str_repeat('f', intdiv($mask, 4));
         if ($mask % 4) {
             $binMask .= dechex(15 << (4 - ($mask % 4)));
         }
         $binMask = str_pad($binMask, 32, '0');
         $binMask = pack('H*', $binMask);
+        if ($binMask === false) {
+            return false;
+        }
         
         return ($ipBin & $binMask) === ($subnetBin & $binMask);
     }
 }
 
-class ConnectionCache {
-    private static $cache = [];
+final class ConnectionCache {
+    private static array $cache = [];
+    private static int $hits = 0;
+    private static int $misses = 0;
     
     public static function getConnections(string $file, int $family, bool $includeProcess = false): array {
         $maxConnections = Config::get('max_connections_per_scan', 50000);
@@ -776,17 +930,20 @@ class ConnectionCache {
         $key = $file . '_' . $family . '_' . (int)$includeProcess;
         
         $fileHash = self::getFileHash($file);
-        if ($fileHash === null) return [];
+        if ($fileHash === null) {
+            return [];
+        }
         
         $cacheKey = $key . '_' . $fileHash;
         
         if (!isset(self::$cache[$cacheKey]) || self::isCacheExpired($cacheKey)) {
+            self::$misses++;
             PerformanceTracker::startTimer("read_connections_$family");
             $connections = self::readConnections($file, $family, $includeProcess);
             
             if (count($connections) > $maxConnections) {
                 $connections = array_slice($connections, 0, $maxConnections);
-                Logger::log("Limited connections to $maxConnections for $file", 'WARNING');
+                Logger::warning("Limited connections to $maxConnections for $file");
             }
             
             self::$cache[$cacheKey] = [
@@ -796,35 +953,37 @@ class ConnectionCache {
             ];
             PerformanceTracker::stopTimer("read_connections_$family");
             self::cleanupOldCache();
+        } else {
+            self::$hits++;
         }
         
         return self::$cache[$cacheKey]['data'];
     }
     
     private static function isCacheExpired(string $cacheKey): bool {
-        return (time() - self::$cache[$cacheKey]['timestamp']) > Config::get('connection_cache_ttl');
+        return (time() - self::$cache[$cacheKey]['timestamp']) > Config::get('connection_cache_ttl', 1);
     }
     
     private static function getFileHash(string $file): ?string {
         if (!Security::validatePath($file)) {
-            Logger::log("Invalid path for file hash: $file", 'DEBUG');
+            Logger::debug("Invalid path for file hash: $file");
             return null;
         }
         
-        if (!file_exists($file) || !is_readable($file)) {
-            Logger::log("Cannot access file for hash: $file", 'DEBUG');
+        if (!is_file($file) || !is_readable($file)) {
+            Logger::debug("Cannot access file for hash: $file");
             return null;
         }
         
-        $fileSize = @filesize($file);
-        if ($fileSize > MAX_FILE_SIZE) {
-            Logger::log("File too large for hash: $file ($fileSize bytes)", 'WARNING');
+        $fileSize = filesize($file);
+        if ($fileSize === false || $fileSize > MAX_FILE_SIZE) {
+            Logger::warning("File too large for hash: $file (" . ($fileSize ?: 'unknown') . " bytes)");
             return null;
         }
         
-        $content = @file_get_contents($file);
+        $content = file_get_contents($file);
         if ($content === false) {
-            Logger::log("Failed to read file for hash: $file", 'DEBUG');
+            Logger::debug("Failed to read file for hash: $file");
             return null;
         }
         
@@ -836,12 +995,13 @@ class ConnectionCache {
             throw new RuntimeException("Security violation: Invalid file path '$file'");
         }
 
-        if (!file_exists($file)) return [];
-        if (!is_readable($file)) return [];
+        if (!is_file($file) || !is_readable($file)) {
+            return [];
+        }
 
-        $handle = @fopen($file, 'r');
+        $handle = fopen($file, 'r');
         if ($handle === false) {
-            Logger::log("Cannot open file: $file", 'DEBUG');
+            Logger::debug("Cannot open file: $file");
             return [];
         }
 
@@ -857,22 +1017,24 @@ class ConnectionCache {
             while (($line = fgets($handle)) !== false) {
                 $lineCount++;
                 if ($lineCount > $maxConnections) {
-                    Logger::log("Reached max connections limit for $file at line $lineCount", 'WARNING');
+                    Logger::warning("Reached max connections limit for $file at line $lineCount");
                     break;
                 }
                 
                 PerformanceTracker::recordOperation('connection_parse');
                 $line = trim($line);
-                if (empty($line)) continue;
+                if ($line === '') continue;
 
                 $fields = preg_split('/\s+/', $line);
                 if (count($fields) < 10) continue;
 
                 $connection = self::parseConnectionLine($fields, $family, $processMap);
-                if ($connection) $connections[] = $connection;
+                if ($connection !== null) {
+                    $connections[] = $connection;
+                }
             }
-        } catch (Exception $e) {
-            Logger::log("Error reading connections from $file: " . $e->getMessage(), 'ERROR');
+        } catch (Throwable $e) {
+            Logger::error("Error reading connections from $file: " . $e->getMessage());
             throw $e;
         } finally {
             fclose($handle);
@@ -882,9 +1044,20 @@ class ConnectionCache {
     }
     
     private static function parseConnectionLine(array $fields, int $family, ?array $processMap): ?array {
-        list($localIpHex, $localPortHex) = explode(':', $fields[1], 2);
-        list($remoteIpHex, $remotePortHex) = explode(':', $fields[2], 2);
-
+        if (!isset($fields[1], $fields[2], $fields[3], $fields[9])) {
+            return null;
+        }
+        
+        $localParts = explode(':', $fields[1], 2);
+        $remoteParts = explode(':', $fields[2], 2);
+        
+        if (count($localParts) !== 2 || count($remoteParts) !== 2) {
+            return null;
+        }
+        
+        list($localIpHex, $localPortHex) = $localParts;
+        list($remoteIpHex, $remotePortHex) = $remoteParts;
+        
         if ($family === AF_INET) {
             $localIp = IPUtils::hexToIpv4($localIpHex);
             $remoteIp = IPUtils::hexToIpv4($remoteIpHex);
@@ -914,34 +1087,30 @@ class ConnectionCache {
         ];
     }
     
-    private static function getProcessByInode($inode, array $processMap): string {
+    private static function getProcessByInode(string $inode, array $processMap): string {
         static $processCache = [];
         static $cacheSize = 0;
+        
+        if (isset($processCache[$inode])) {
+            return $processCache[$inode];
+        }
+        
+        $process = $processMap[$inode] ?? '';
+        $processCache[$inode] = $process;
+        $cacheSize++;
         
         if ($cacheSize > 10000) {
             $processCache = [];
             $cacheSize = 0;
         }
         
-        if (isset($processCache[$inode])) {
-            return $processCache[$inode];
-        }
-        
-        if (isset($processMap[$inode])) {
-            $processCache[$inode] = $processMap[$inode];
-            $cacheSize++;
-            return $processMap[$inode];
-        }
-
-        $processCache[$inode] = "";
-        $cacheSize++;
-        return "";
+        return $process;
     }
     
     private static function cleanupOldCache(): void {
         $now = time();
         $ttl = Config::get('connection_cache_ttl', 1);
-        $maxSize = Config::get('max_cache_size', 10000);
+        $maxSize = Config::get('max_cache_size', MAX_CACHE_ENTRIES);
         
         foreach (self::$cache as $key => $data) {
             if ($now - $data['timestamp'] > $ttl * 2) {
@@ -950,28 +1119,42 @@ class ConnectionCache {
         }
         
         if (count(self::$cache) > $maxSize) {
-            uasort(self::$cache, function($a, $b) {
-                return $b['timestamp'] <=> $a['timestamp'];
-            });
+            uasort(self::$cache, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
             self::$cache = array_slice(self::$cache, 0, $maxSize, true);
         }
     }
     
     public static function clearCache(): void {
         self::$cache = [];
+        self::$hits = 0;
+        self::$misses = 0;
+    }
+    
+    public static function getStats(): array {
+        return [
+            'cache_entries' => count(self::$cache),
+            'hits' => self::$hits,
+            'misses' => self::$misses,
+            'hit_rate' => (self::$hits + self::$misses) > 0 ? 
+                round(self::$hits / (self::$hits + self::$misses) * 100, 2) : 0
+        ];
     }
 }
 
-class OutputFormatter {
+final class OutputFormatter {
     public static function formatTable(array $connections, bool $showProcess = false): string {
-        if (empty($connections)) return "No connections found.\n";
+        if (empty($connections)) {
+            return "No connections found.\n";
+        }
 
         self::sortConnections($connections);
         $output = "\nACTIVE TCP CONNECTIONS:\n";
 
         if ($showProcess) {
-            $output .= sprintf("%-5s %-15s %-25s %-25s %-30s\n", "Proto", "State", "Local Address", "Remote Address", "Process");
+            $output .= sprintf("%-5s %-15s %-25s %-25s %-30s\n", 
+                "Proto", "State", "Local Address", "Remote Address", "Process");
             $output .= str_repeat("-", 105) . "\n";
+            
             foreach ($connections as $c) {
                 $color = self::getStateColor($c['state']);
                 $reset = COLORS['reset'];
@@ -986,8 +1169,10 @@ class OutputFormatter {
                 );
             }
         } else {
-            $output .= sprintf("%-5s %-15s %-25s %-25s\n", "Proto", "State", "Local Address", "Remote Address");
+            $output .= sprintf("%-5s %-15s %-25s %-25s\n", 
+                "Proto", "State", "Local Address", "Remote Address");
             $output .= str_repeat("-", 75) . "\n";
+            
             foreach ($connections as $c) {
                 $color = self::getStateColor($c['state']);
                 $reset = COLORS['reset'];
@@ -1020,11 +1205,14 @@ class OutputFormatter {
             $output = $connections;
         }
 
-        return json_encode($output, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
+        return json_encode($output, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR) . "\n";
     }
 
     public static function formatCsv(array $connections): string {
-        if (empty($connections)) return "";
+        if (empty($connections)) {
+            return "";
+        }
+        
         $output = "Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode\n";
         
         foreach ($connections as $conn) {
@@ -1065,9 +1253,7 @@ class OutputFormatter {
             $output .= "\nConnections by Process (Top 10):\n";
             $output .= str_repeat("-", 50) . "\n";
 
-            uasort($stats['by_process'], function($a, $b) {
-                return $b <=> $a;
-            });
+            uasort($stats['by_process'], fn($a, $b) => $b <=> $a);
 
             $count = 0;
             foreach ($stats['by_process'] as $process => $connCount) {
@@ -1110,7 +1296,8 @@ class OutputFormatter {
     private static function sortConnections(array &$connections): void {
         usort($connections, function ($a, $b) {
             return $a['local_port'] <=> $b['local_port'] ?:
-                   strcmp($a['proto'], $b['proto']);
+                   $a['proto'] <=> $b['proto'] ?:
+                   $a['state'] <=> $b['state'];
         });
     }
 
@@ -1137,15 +1324,19 @@ class OutputFormatter {
 
     private static function escapeCsvField(string $field): string {
         $field = str_replace('"', '""', $field);
-        if (strpos($field, ',') !== false || strpos($field, '"') !== false || 
-            strpos($field, "\n") !== false || strpos($field, "\r") !== false) {
+        if (str_contains($field, ',') || str_contains($field, '"') || 
+            str_contains($field, "\n") || str_contains($field, "\r")) {
             return '"' . $field . '"';
         }
         return $field;
     }
+    
+    public static function stripColors(string $text): string {
+        return preg_replace('/\033\[[0-9;]*m/', '', $text);
+    }
 }
 
-class ConnectionFilter {
+final class ConnectionFilter {
     public static function filter(array $connections, array $options): array {
         $filtered = $connections;
 
@@ -1198,13 +1389,13 @@ class ConnectionFilter {
 
     private static function ipMatchesFilter(string $ip, string $filter): bool {
         if ($ip === $filter) return true;
-        if (strpos($filter, '/') !== false) return IPUtils::ipInCidr($ip, $filter);
+        if (str_contains($filter, '/')) return IPUtils::ipInCidr($ip, $filter);
         return false;
     }
 }
 
-class ConnectionHistory {
-    private static $history = [];
+final class ConnectionHistory {
+    private static array $history = [];
 
     public static function trackChanges(array $current): array {
         $changes = [
@@ -1224,7 +1415,9 @@ class ConnectionHistory {
         }
 
         self::$history[] = ['connections' => $current, 'changes' => $changes];
-        if (count(self::$history) > Config::get('max_history')) {
+        
+        $maxHistory = Config::get('max_history', 1000);
+        if (count(self::$history) > $maxHistory) {
             array_shift(self::$history);
         }
 
@@ -1232,7 +1425,13 @@ class ConnectionHistory {
     }
 
     private static function getConnectionKey(array $conn): string {
-        return "{$conn['local_ip']}:{$conn['local_port']}-{$conn['remote_ip']}:{$conn['remote_port']}-{$conn['state']}";
+        return sprintf("%s:%d-%s:%d-%s",
+            $conn['local_ip'],
+            $conn['local_port'],
+            $conn['remote_ip'],
+            $conn['remote_port'],
+            $conn['state']
+        );
     }
     
     public static function clearHistory(): void {
@@ -1240,29 +1439,44 @@ class ConnectionHistory {
     }
     
     public static function getHistoryStats(): array {
+        $totalTracked = 0;
+        foreach (self::$history as $entry) {
+            $totalTracked += count($entry['connections']);
+        }
+        
         return [
             'history_size' => count(self::$history),
-            'total_tracked' => array_sum(array_map(fn($h) => count($h['connections']), self::$history))
+            'total_tracked' => $totalTracked
         ];
     }
 }
 
-class SignalHandler {
-    private static $shouldExit = false;
-    private static $startTime;
+final class SignalHandler {
+    private static bool $shouldExit = false;
+    private static int $startTime;
+    private static bool $initialized = false;
 
     public static function init(): void {
+        if (self::$initialized) {
+            return;
+        }
+        
         if (!extension_loaded('pcntl')) {
-            Logger::log("PCNTL extension not loaded - signal handling disabled", 'WARNING');
+            Logger::warning("PCNTL extension not loaded - signal handling disabled");
             return;
         }
 
         self::$startTime = time();
+        self::$initialized = true;
 
         pcntl_signal(SIGINT, [self::class, 'handleSignal']);
         pcntl_signal(SIGTERM, [self::class, 'handleSignal']);
         pcntl_signal(SIGHUP, [self::class, 'handleSignal']);
         pcntl_signal(SIGUSR1, [self::class, 'handleSignal']);
+        
+        if (function_exists('pcntl_async_signals')) {
+            pcntl_async_signals(true);
+        }
     }
 
     public static function handleSignal(int $signo): void {
@@ -1272,16 +1486,16 @@ class SignalHandler {
                 self::$shouldExit = true;
                 $duration = time() - self::$startTime;
                 echo "\n\nMonitoring stopped after {$duration} seconds.\n";
-                Logger::log("Received signal $signo, shutting down after $duration seconds");
+                Logger::info("Received signal $signo, shutting down after $duration seconds");
                 Logger::shutdown();
                 exit(0);
             case SIGHUP:
-                Logger::log("Received SIGHUP, reloading configuration");
+                Logger::info("Received SIGHUP, reloading configuration");
                 Config::loadFromEnv();
                 break;
             case SIGUSR1:
                 $metrics = PerformanceTracker::getMetrics();
-                Logger::log("Debug signal received - Metrics: " . json_encode($metrics));
+                Logger::debug("Debug signal received - Metrics: " . json_encode($metrics));
                 break;
         }
     }
@@ -1292,10 +1506,15 @@ class SignalHandler {
         }
         return self::$shouldExit;
     }
+    
+    public static function reset(): void {
+        self::$shouldExit = false;
+        self::$initialized = false;
+    }
 }
 
-class TCPConnectionMonitor {
-    private $options;
+final class TCPConnectionMonitor {
+    private array $options;
     
     public function __construct(array $options = []) {
         $this->options = $options;
@@ -1327,8 +1546,8 @@ class TCPConnectionMonitor {
     }
 }
 
-class ConnectionWatcher {
-    private $monitor;
+final class ConnectionWatcher {
+    private TCPConnectionMonitor $monitor;
     
     public function __construct(TCPConnectionMonitor $monitor) {
         $this->monitor = $monitor;
@@ -1409,7 +1628,7 @@ class ConnectionWatcher {
     }
 }
 
-class OptionParser {
+final class OptionParser {
     public static function parse(array $argv): array {
         $script = basename($argv[0] ?? 'tcp_monitor.php');
         
@@ -1418,11 +1637,16 @@ class OptionParser {
             "timewait", "closewait", "finwait", "port:", "watch::",
             "local-ip:", "remote-ip:", "stats", "ipv4", "ipv6", "verbose",
             "csv", "output:", "log-file:", "no-processes", "debug",
-            "config:", "env-file:"
-        ]);
+            "config:", "env-file:", "version"
+        ], $restIndex);
 
         if (isset($options['help'])) {
             self::displayHelp($script);
+            exit(0);
+        }
+        
+        if (isset($options['version'])) {
+            echo "TCP Connection Monitor v1.0.0\n";
             exit(0);
         }
         
@@ -1433,7 +1657,7 @@ class OptionParser {
     
     private static function loadConfig(array &$options): void {
         if (isset($options['env-file'])) {
-            self::loadEnvFile($options['env-file']);
+            Config::loadFromEnvFile($options['env-file']);
         }
         
         if (isset($options['config'])) {
@@ -1441,22 +1665,7 @@ class OptionParser {
         }
         
         Config::loadFromEnv();
-    }
-    
-    private static function loadEnvFile(string $file): void {
-        if (!file_exists($file)) {
-            throw new RuntimeException("Environment file not found: $file");
-        }
-        
-        $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        foreach ($lines as $line) {
-            if (strpos(trim($line), '#') === 0) continue;
-            
-            if (strpos($line, '=') !== false) {
-                list($key, $value) = explode('=', $line, 2);
-                $_ENV[trim($key)] = trim($value);
-            }
-        }
+        Logger::setLogLevel(Config::get('log_level', 'INFO'));
     }
     
     private static function validateOptions(array &$options): void {
@@ -1499,40 +1708,54 @@ class OptionParser {
     }
     
     private static function displayHelp(string $script): void {
-        echo "Usage: php {$script} [options]\n";
-        echo "Options:\n";
-        echo "  --json         Output connections in JSON format\n";
-        echo "  --csv          Output connections in CSV format\n";
-        echo "  --listen       Show only listening sockets\n";
-        echo "  --established  Show only established connections\n";
-        echo "  --timewait     Show only TIME_WAIT connections\n";
-        echo "  --closewait    Show only CLOSE_WAIT connections\n";
-        echo "  --finwait      Show only FIN_WAIT1/FIN_WAIT2 connections\n";
-        echo "  --count        Only show counts (IPv4/IPv6/total)\n";
-        echo "  --processes    Show process information (slower)\n";
-        echo "  --no-processes Disable process scanning (faster)\n";
-        echo "  --port <num>   Filter by port number\n";
-        echo "  --local-ip <ip>  Filter by local IP address (supports CIDR)\n";
-        echo "  --remote-ip <ip> Filter by remote IP address (supports CIDR)\n";
-        echo "  --ipv4         Show only IPv4 connections\n";
-        echo "  --ipv6         Show only IPv6 connections\n";
-        echo "  --watch [sec]  Refresh continuously (default: 2s)\n";
-        echo "  --stats        Show detailed statistics\n";
-        echo "  --output <file>  Write output to file\n";
-        echo "  --log-file <file> Write logs to file\n";
-        echo "  --config <file>   Load configuration from JSON file\n";
-        echo "  --env-file <file> Load environment variables from file\n";
-        echo "  --verbose, -v  Show performance metrics\n";
-        echo "  --debug        Enable debug logging\n";
-        echo "  --help         Show this help message\n";
+        echo <<<HELP
+Usage: php {$script} [options]
+
+Monitor TCP connections on Linux systems.
+
+Options:
+  --json              Output connections in JSON format
+  --csv               Output connections in CSV format
+  --listen            Show only listening sockets
+  --established       Show only established connections
+  --timewait          Show only TIME_WAIT connections
+  --closewait         Show only CLOSE_WAIT connections
+  --finwait           Show only FIN_WAIT1/FIN_WAIT2 connections
+  --count             Only show counts (IPv4/IPv6/total)
+  --processes         Show process information (slower)
+  --no-processes      Disable process scanning (faster)
+  --port <num>        Filter by port number
+  --local-ip <ip>     Filter by local IP address (supports CIDR)
+  --remote-ip <ip>    Filter by remote IP address (supports CIDR)
+  --ipv4              Show only IPv4 connections
+  --ipv6              Show only IPv6 connections
+  --watch [sec]       Refresh continuously (default: 2s)
+  --stats             Show detailed statistics
+  --output <file>     Write output to file
+  --log-file <file>   Write logs to file
+  --config <file>     Load configuration from JSON file
+  --env-file <file>   Load environment variables from file
+  --verbose, -v       Show performance metrics
+  --debug             Enable debug logging
+  --version           Show version information
+  --help              Show this help message
+
+Examples:
+  php {$script} --listen --processes
+  php {$script} --port 80 --established
+  php {$script} --watch=5 --local-ip 192.168.1.0/24
+  php {$script} --json --output connections.json
+
+HELP;
     }
 }
 
-class Exporter {
+final class Exporter {
     public static function toFile(string $content, string $filename): void {
-        $tempFile = $filename . '.tmp';
-        $result = file_put_contents($tempFile, $content, LOCK_EX);
-        if ($result === false) {
+        $tempFile = Security::createTempFile('tcpmon_', dirname($filename));
+        
+        if (file_put_contents($tempFile, $content, LOCK_EX) === false) {
+            unlink($tempFile);
             throw new RuntimeException("Failed to write to temporary file: $tempFile");
         }
         
@@ -1541,12 +1764,24 @@ class Exporter {
             throw new RuntimeException("Failed to rename temporary file to: $filename");
         }
         
-        echo "Output written to: $filename\n";
-        Logger::log("Output written to: $filename");
+        Logger::info("Output written to: $filename");
+    }
+    
+    public static function toFileWithBackup(string $content, string $filename): void {
+        if (file_exists($filename)) {
+            $backup = $filename . '.bak';
+            if (file_exists($backup)) {
+                unlink($backup);
+            }
+            rename($filename, $backup);
+            Logger::debug("Created backup: $backup");
+        }
+        
+        self::toFile($content, $filename);
     }
 }
 
-class Application {
+final class Application {
     public static function run(): void {
         try {
             PerformanceTracker::start();
@@ -1555,7 +1790,7 @@ class Application {
                 throw new RuntimeException("This script must be run from the command line.");
             }
 
-            if (!stristr(PHP_OS, 'Linux')) {
+            if (PHP_OS_FAMILY !== 'Linux') {
                 throw new RuntimeException("This script is only supported on Linux systems.");
             }
 
@@ -1563,7 +1798,7 @@ class Application {
 
             if (function_exists('posix_geteuid') && posix_geteuid() !== 0) {
                 fwrite(STDERR, "Note: Some information may be limited without root privileges.\n");
-                Logger::log("Running without root privileges - some information may be limited");
+                Logger::info("Running without root privileges - some information may be limited");
             }
 
             $options = OptionParser::parse($_SERVER['argv']);
@@ -1598,19 +1833,26 @@ class Application {
                 $output = OutputFormatter::formatJson($connections, $options['stats'] ?? false);
             } elseif (isset($options['csv'])) {
                 $output = OutputFormatter::formatCsv($connections);
+                if (isset($options['output'])) {
+                    $output = OutputFormatter::stripColors($output);
+                }
             } else {
                 $output = OutputFormatter::formatTable($connections, $options['processes'] ?? false);
+                if (isset($options['output'])) {
+                    $output = OutputFormatter::stripColors($output);
+                }
             }
 
             if (isset($options['output'])) {
-                Exporter::toFile($output, $options['output']);
+                Exporter::toFileWithBackup($output, $options['output']);
+                echo "Output written to: {$options['output']}\n";
             } else {
                 echo $output;
             }
 
             self::displayPerformanceMetrics($options);
 
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             ErrorHandler::handle($e, $options['verbose'] ?? false);
             exit(1);
         }
@@ -1619,10 +1861,25 @@ class Application {
     private static function displayPerformanceMetrics(array $options): void {
         if (isset($options['verbose']) || isset($options['v']) || isset($options['debug'])) {
             $metrics = PerformanceTracker::getMetrics();
+            $processStats = ProcessCache::getStats();
+            $connectionStats = ConnectionCache::getStats();
+            $historyStats = ConnectionHistory::getHistoryStats();
+            
             echo "\nPerformance Metrics:\n";
+            echo str_repeat("-", 40) . "\n";
             echo "Execution time: {$metrics['execution_time']}s\n";
             echo "Memory peak: {$metrics['memory_peak_mb']} MB\n";
             echo "Operations: {$metrics['operations']}\n";
+            
+            echo "\nCache Statistics:\n";
+            echo "  Process cache: {$processStats['cache_size']} entries, ";
+            echo "{$processStats['hit_rate']}% hit rate\n";
+            echo "  Connection cache: {$connectionStats['cache_entries']} entries, ";
+            echo "{$connectionStats['hit_rate']}% hit rate\n";
+            
+            echo "\nHistory Stats:\n";
+            echo "  History size: {$historyStats['history_size']}\n";
+            echo "  Total tracked: {$historyStats['total_tracked']}\n";
             
             if (!empty($metrics['timers'])) {
                 echo "\nTimers:\n";
@@ -1632,11 +1889,6 @@ class Application {
                     }
                 }
             }
-            
-            $historyStats = ConnectionHistory::getHistoryStats();
-            echo "\nHistory Stats:\n";
-            echo "  History size: {$historyStats['history_size']}\n";
-            echo "  Total tracked: {$historyStats['total_tracked']}\n";
         }
     }
 }
