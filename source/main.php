@@ -18,13 +18,6 @@ const MIN_CIDR_IPV4 = 0;
 const MAX_CIDR_IPV4 = 32;
 const MIN_CIDR_IPV6 = 0;
 const MAX_CIDR_IPV6 = 128;
-const MAX_CONNECTION_AGE = 3600;
-const MAX_PROCESS_SCAN_TIME = 30;
-const MAX_FILE_SIZE = 10485760;
-const MEMORY_WARNING_THRESHOLD = 256 * 1024 * 1024;
-const MEMORY_CRITICAL_THRESHOLD = 384 * 1024 * 1024;
-const MAX_PID = 4194304;
-const MAX_CACHE_ENTRIES = 10000;
 
 const TCP_STATES = [
     '01' => "ESTABLISHED",
@@ -104,13 +97,20 @@ final class Security {
             $path = '/' . $path;
         }
         
+        if (preg_match('/\/proc\/\d+\/\.\./', $path)) {
+            throw new RuntimeException("Path traversal attempt detected");
+        }
+        
         $parts = explode('/', $path);
         $result = [];
         
         foreach ($parts as $part) {
             if ($part === '' || $part === '.') continue;
             if ($part === '..') {
-                if (!empty($result)) array_pop($result);
+                if (empty($result) || end($result) === 'proc') {
+                    continue;
+                }
+                array_pop($result);
                 continue;
             }
             $result[] = $part;
@@ -146,7 +146,8 @@ final class Security {
     }
     
     public static function validatePid(int $pid): bool {
-        return $pid > 0 && $pid <= MAX_PID;
+        $maxPid = Config::get('max_pid', 4194304);
+        return $pid > 0 && $pid <= $maxPid;
     }
     
     public static function createTempFile(string $prefix, string $directory = null): string {
@@ -175,6 +176,13 @@ final class Config {
         'socket_read_timeout' => 5,
         'enable_process_scan' => true,
         'log_level' => 'INFO',
+        'max_file_size' => 10485760,
+        'memory_warning_threshold' => 268435456,
+        'memory_critical_threshold' => 402653184,
+        'max_pid' => 4194304,
+        'max_cache_entries' => 10000,
+        'max_process_scan_time' => 30,
+        'process_scan_cooldown' => 2,
     ];
     
     public static function get(string $key, $default = null) {
@@ -265,6 +273,11 @@ final class Config {
             }
         }
     }
+    
+    public static function reload(): void {
+        self::$config = [];
+        self::loadFromEnv();
+    }
 }
 
 final class RateLimiter {
@@ -339,8 +352,8 @@ final class PerformanceTracker {
                 self::$timers[$name]['total'] = 0.0;
                 self::$timers[$name]['count'] = 0;
             }
-            self::$timers[$type]['total'] += $duration;
-            self::$timers[$type]['count']++;
+            self::$timers[$name]['total'] += $duration;
+            self::$timers[$name]['count']++;
         }
     }
 
@@ -352,13 +365,16 @@ final class PerformanceTracker {
             self::$memoryPeak = $peakMemory;
         }
         
-        if ($currentMemory > MEMORY_CRITICAL_THRESHOLD && !self::$gcTriggered) {
+        $memoryCriticalThreshold = Config::get('memory_critical_threshold', 384 * 1024 * 1024);
+        $memoryWarningThreshold = Config::get('memory_warning_threshold', 256 * 1024 * 1024);
+        
+        if ($currentMemory > $memoryCriticalThreshold && !self::$gcTriggered) {
             Logger::error("Critical memory usage: " . round($currentMemory/1024/1024, 2) . "MB");
             gc_collect_cycles();
             self::$gcTriggered = true;
-        } elseif ($currentMemory > MEMORY_WARNING_THRESHOLD && !self::$gcTriggered) {
+        } elseif ($currentMemory > $memoryWarningThreshold && !self::$gcTriggered) {
             Logger::warning("High memory usage: " . round($currentMemory/1024/1024, 2) . "MB");
-        } elseif ($currentMemory <= MEMORY_WARNING_THRESHOLD) {
+        } elseif ($currentMemory <= $memoryWarningThreshold) {
             self::$gcTriggered = false;
         }
         
@@ -461,11 +477,7 @@ final class Logger {
                 fwrite(STDERR, "Failed to write to log file: " . self::$logFile . "\n");
             }
         } else {
-            if ($level === 'ERROR' || $level === 'FATAL') {
-                fwrite(STDERR, $logContent);
-            } else {
-                fwrite(STDOUT, $logContent);
-            }
+            fwrite(STDERR, $logContent);
         }
         
         self::$logBuffer = [];
@@ -500,7 +512,8 @@ final class ErrorHandler {
             throw new RuntimeException("Cannot determine size of file: $file");
         }
         
-        if ($fileSize > MAX_FILE_SIZE) {
+        $maxFileSize = Config::get('max_file_size', 10485760);
+        if ($fileSize > $maxFileSize) {
             throw new RuntimeException("File $file is too large ($fileSize bytes)");
         }
         
@@ -608,7 +621,8 @@ final class InputValidator {
     }
     
     public static function validatePid($pid): int {
-        return Security::validateInteger($pid, 1, MAX_PID);
+        $maxPid = Config::get('max_pid', 4194304);
+        return Security::validateInteger($pid, 1, $maxPid);
     }
 }
 
@@ -620,15 +634,22 @@ final class ProcessCache {
     private static ?array $connectionInodes = null;
     private static int $hits = 0;
     private static int $misses = 0;
+    private static int $lastScan = 0;
 
     public static function getProcessMap(): array {
         $now = time();
         $ttl = Config::get('process_cache_ttl', 5);
+        $scanCooldown = Config::get('process_scan_cooldown', 2);
         
         if (empty(self::$cache) || ($now - self::$lastBuild) > $ttl) {
+            if ($now - self::$lastScan < $scanCooldown) {
+                return self::$cache;
+            }
+            
             self::$misses++;
             self::$cache = self::buildProcessMap();
             self::$lastBuild = $now;
+            self::$lastScan = $now;
             self::enforceCacheLimits();
         } else {
             self::$hits++;
@@ -661,6 +682,8 @@ final class ProcessCache {
             }
 
             self::$scanStartTime = time();
+            $maxScanTime = Config::get('max_process_scan_time', 30);
+            
             $procDir = opendir('/proc');
             if ($procDir === false) {
                 throw new RuntimeException("Cannot open /proc directory");
@@ -670,8 +693,8 @@ final class ProcessCache {
                 while (($entry = readdir($procDir)) !== false) {
                     if (!ctype_digit($entry)) continue;
                     
-                    if ((time() - self::$scanStartTime) > MAX_PROCESS_SCAN_TIME) {
-                        Logger::warning("Process scan timeout after " . MAX_PROCESS_SCAN_TIME . " seconds");
+                    if ((time() - self::$scanStartTime) > $maxScanTime) {
+                        Logger::warning("Process scan timeout after " . $maxScanTime . " seconds");
                         break;
                     }
 
@@ -797,7 +820,7 @@ final class ProcessCache {
     }
     
     private static function enforceCacheLimits(): void {
-        $maxSize = Config::get('max_cache_size', MAX_CACHE_ENTRIES);
+        $maxSize = Config::get('max_cache_size', 10000);
         if (count(self::$cache) > $maxSize) {
             self::$cache = array_slice(self::$cache, -$maxSize, null, true);
             Logger::info("Process cache trimmed to $maxSize entries");
@@ -809,6 +832,7 @@ final class ProcessCache {
         self::$lastBuild = 0;
         self::$hits = 0;
         self::$misses = 0;
+        self::$lastScan = 0;
     }
     
     public static function disableProcessScan(): void {
@@ -816,12 +840,12 @@ final class ProcessCache {
     }
     
     public static function getStats(): array {
+        $total = self::$hits + self::$misses;
         return [
             'cache_size' => count(self::$cache),
             'hits' => self::$hits,
             'misses' => self::$misses,
-            'hit_rate' => (self::$hits + self::$misses) > 0 ? 
-                round(self::$hits / (self::$hits + self::$misses) * 100, 2) : 0
+            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0
         ];
     }
 }
@@ -976,12 +1000,18 @@ final class ConnectionCache {
         }
         
         $fileSize = filesize($file);
-        if ($fileSize === false || $fileSize > MAX_FILE_SIZE) {
-            Logger::warning("File too large for hash: $file (" . ($fileSize ?: 'unknown') . " bytes)");
+        if ($fileSize === false) {
+            Logger::warning("Cannot determine file size: $file");
             return null;
         }
         
-        $content = file_get_contents($file);
+        $maxFileSize = Config::get('max_file_size', 10485760);
+        if ($fileSize > $maxFileSize) {
+            Logger::warning("File too large for hash: $file ($fileSize bytes)");
+            return null;
+        }
+        
+        $content = file_get_contents($file, false, null, 0, 8192);
         if ($content === false) {
             Logger::debug("Failed to read file for hash: $file");
             return null;
@@ -1095,7 +1125,7 @@ final class ConnectionCache {
             return $processCache[$inode];
         }
         
-        $process = $processMap[$inode] ?? '';
+        $process = $processMap[$inode] ?? '[unknown]';
         $processCache[$inode] = $process;
         $cacheSize++;
         
@@ -1110,7 +1140,7 @@ final class ConnectionCache {
     private static function cleanupOldCache(): void {
         $now = time();
         $ttl = Config::get('connection_cache_ttl', 1);
-        $maxSize = Config::get('max_cache_size', MAX_CACHE_ENTRIES);
+        $maxSize = Config::get('max_cache_size', 10000);
         
         foreach (self::$cache as $key => $data) {
             if ($now - $data['timestamp'] > $ttl * 2) {
@@ -1131,12 +1161,12 @@ final class ConnectionCache {
     }
     
     public static function getStats(): array {
+        $total = self::$hits + self::$misses;
         return [
             'cache_entries' => count(self::$cache),
             'hits' => self::$hits,
             'misses' => self::$misses,
-            'hit_rate' => (self::$hits + self::$misses) > 0 ? 
-                round(self::$hits / (self::$hits + self::$misses) * 100, 2) : 0
+            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0
         ];
     }
 }
@@ -1158,7 +1188,7 @@ final class OutputFormatter {
             foreach ($connections as $c) {
                 $color = self::getStateColor($c['state']);
                 $reset = COLORS['reset'];
-                $process = $c['process'] ?: 'unknown';
+                $process = $c['process'] ?: '[unknown]';
                 $output .= sprintf(
                     "%-5s {$color}%-15s{$reset} %-25s %-25s %-30s\n",
                     $c['proto'],
@@ -1257,7 +1287,7 @@ final class OutputFormatter {
 
             $count = 0;
             foreach ($stats['by_process'] as $process => $connCount) {
-                if (empty($process)) continue;
+                if (empty($process) || $process === '[unknown]') continue;
                 $output .= sprintf("%-40s: %d\n", $process, $connCount);
                 if (++$count >= 10) break;
             }
@@ -1487,11 +1517,14 @@ final class SignalHandler {
                 $duration = time() - self::$startTime;
                 echo "\n\nMonitoring stopped after {$duration} seconds.\n";
                 Logger::info("Received signal $signo, shutting down after $duration seconds");
+                ProcessCache::clearCache();
+                ConnectionCache::clearCache();
+                ConnectionHistory::clearHistory();
                 Logger::shutdown();
                 exit(0);
             case SIGHUP:
                 Logger::info("Received SIGHUP, reloading configuration");
-                Config::loadFromEnv();
+                Config::reload();
                 break;
             case SIGUSR1:
                 $metrics = PerformanceTracker::getMetrics();
