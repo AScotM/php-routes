@@ -63,8 +63,8 @@ final class Security {
             return false;
         }
         
-        if (str_contains($normalizedPath, '..')) {
-            Logger::debug("Path validation failed: $normalizedPath contains parent directory reference");
+        if ($path !== $normalizedPath && (str_contains($path, '..') || str_contains($path, '//'))) {
+            Logger::debug("Path traversal attempt detected: $path -> $normalizedPath");
             return false;
         }
         
@@ -95,10 +95,6 @@ final class Security {
         
         if ($path[0] !== '/') {
             $path = '/' . $path;
-        }
-        
-        if (preg_match('/\/proc\/\d+\/\.\./', $path)) {
-            throw new RuntimeException("Path traversal attempt detected");
         }
         
         $parts = explode('/', $path);
@@ -156,6 +152,7 @@ final class Security {
         if ($tempFile === false) {
             throw new RuntimeException("Failed to create temporary file");
         }
+        TempFileRegistry::register($tempFile);
         return $tempFile;
     }
 }
@@ -183,6 +180,9 @@ final class Config {
         'max_cache_entries' => 10000,
         'max_process_scan_time' => 30,
         'process_scan_cooldown' => 2,
+        'max_inodes_to_scan' => 100000,
+        'max_watch_connections' => 100000,
+        'cache_rebuild_lock_timeout' => 30,
     ];
     
     public static function get(string $key, $default = null) {
@@ -238,6 +238,23 @@ final class Config {
         
         if (!is_array($config)) {
             throw new RuntimeException("Invalid JSON structure in config file");
+        }
+        
+        foreach ($config as $key => $value) {
+            if (isset(self::$defaults[$key])) {
+                $expectedType = gettype(self::$defaults[$key]);
+                $actualType = gettype($value);
+                
+                if ($expectedType !== $actualType) {
+                    throw new RuntimeException("Config '$key' expects type $expectedType, got $actualType");
+                }
+                
+                if (str_contains($key, 'threshold') || str_contains($key, 'max_') || str_contains($key, 'limit')) {
+                    if ($value < 0) {
+                        throw new RuntimeException("Config '$key' must be positive");
+                    }
+                }
+            }
         }
         
         self::$config = array_merge(self::$defaults, $config);
@@ -547,6 +564,7 @@ final class ErrorHandler {
     
     public static function handleShutdown(): void {
         Logger::shutdown();
+        TempFileRegistry::cleanup();
         
         $error = error_get_last();
         if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
@@ -586,7 +604,7 @@ final class InputValidator {
             if (count($parts) !== 2) return false;
             
             list($ip, $mask) = $parts;
-            if (!is_numeric($mask)) return false;
+            if ($mask === '' || !is_numeric($mask)) return false;
             
             $mask = (int)$mask;
             if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -635,22 +653,34 @@ final class ProcessCache {
     private static int $hits = 0;
     private static int $misses = 0;
     private static int $lastScan = 0;
+    private static int $lockAcquired = 0;
 
     public static function getProcessMap(): array {
         $now = time();
         $ttl = Config::get('process_cache_ttl', 5);
         $scanCooldown = Config::get('process_scan_cooldown', 2);
+        $lockTimeout = Config::get('cache_rebuild_lock_timeout', 30);
         
         if (empty(self::$cache) || ($now - self::$lastBuild) > $ttl) {
             if ($now - self::$lastScan < $scanCooldown) {
                 return self::$cache;
             }
             
+            if (self::$building && ($now - self::$lockAcquired) < $lockTimeout) {
+                Logger::debug("Cache is being rebuilt by another process, returning existing cache");
+                return self::$cache ?: [];
+            }
+            
             self::$misses++;
-            self::$cache = self::buildProcessMap();
-            self::$lastBuild = $now;
-            self::$lastScan = $now;
-            self::enforceCacheLimits();
+            self::acquireLock();
+            try {
+                self::$cache = self::buildProcessMap();
+                self::$lastBuild = $now;
+                self::$lastScan = $now;
+                self::enforceCacheLimits();
+            } finally {
+                self::releaseLock();
+            }
         } else {
             self::$hits++;
         }
@@ -658,84 +688,88 @@ final class ProcessCache {
         return self::$cache;
     }
 
+    private static function acquireLock(): void {
+        self::$building = true;
+        self::$lockAcquired = time();
+    }
+    
+    private static function releaseLock(): void {
+        self::$building = false;
+        self::$lockAcquired = 0;
+    }
+
     private static function buildProcessMap(): array {
         if (!Config::get('enable_process_scan', true)) {
             return [];
         }
         
-        if (self::$building) {
-            Logger::debug("Process map already being built, returning empty");
-            return [];
+        Security::validateProcFilesystem();
+        
+        $processMap = [];
+        self::$connectionInodes = self::extractInodesFromProcNet();
+        
+        if (empty(self::$connectionInodes)) {
+            Logger::info("No inodes found in /proc/net files");
+            return $processMap;
         }
+
+        self::$scanStartTime = time();
+        $maxScanTime = Config::get('max_process_scan_time', 30);
         
-        self::$building = true;
-        
+        $procDir = opendir('/proc');
+        if ($procDir === false) {
+            throw new RuntimeException("Cannot open /proc directory");
+        }
+
         try {
-            Security::validateProcFilesystem();
-            
-            $processMap = [];
-            self::$connectionInodes = self::extractInodesFromProcNet();
-            
-            if (empty(self::$connectionInodes)) {
-                Logger::info("No inodes found in /proc/net files");
-                return $processMap;
-            }
+            while (($entry = readdir($procDir)) !== false) {
+                if (!ctype_digit($entry)) continue;
+                
+                if ((time() - self::$scanStartTime) > $maxScanTime) {
+                    Logger::warning("Process scan timeout after " . $maxScanTime . " seconds");
+                    break;
+                }
 
-            self::$scanStartTime = time();
-            $maxScanTime = Config::get('max_process_scan_time', 30);
-            
-            $procDir = opendir('/proc');
-            if ($procDir === false) {
-                throw new RuntimeException("Cannot open /proc directory");
-            }
+                $pid = (int)$entry;
+                $processDir = "/proc/{$pid}";
 
-            try {
-                while (($entry = readdir($procDir)) !== false) {
-                    if (!ctype_digit($entry)) continue;
+                if (!is_dir($processDir)) continue;
+
+                $foundInodes = self::scanProcessInodes($pid);
+                if (!empty($foundInodes)) {
+                    $processName = self::getProcessName($pid);
+                    foreach ($foundInodes as $inode) {
+                        $processMap[$inode] = $processName;
+                    }
                     
-                    if ((time() - self::$scanStartTime) > $maxScanTime) {
-                        Logger::warning("Process scan timeout after " . $maxScanTime . " seconds");
+                    if (count($processMap) >= count(self::$connectionInodes)) {
+                        Logger::debug("Found all inodes, stopping scan early");
                         break;
                     }
-
-                    $pid = (int)$entry;
-                    $processDir = "/proc/{$pid}";
-
-                    if (!is_dir($processDir)) continue;
-
-                    $foundInodes = self::scanProcessInodes($pid);
-                    if (!empty($foundInodes)) {
-                        $processName = self::getProcessName($pid);
-                        foreach ($foundInodes as $inode) {
-                            $processMap[$inode] = $processName;
-                        }
-                        
-                        if (count($processMap) >= count(self::$connectionInodes)) {
-                            Logger::debug("Found all inodes, stopping scan early");
-                            break;
-                        }
-                    }
-                    
-                    PerformanceTracker::recordOperation('process_scan');
                 }
-            } finally {
-                closedir($procDir);
+                
+                PerformanceTracker::recordOperation('process_scan');
             }
-            
-            $duration = time() - self::$scanStartTime;
-            Logger::info(sprintf("Built process map with %d entries in %ds", count($processMap), $duration));
-            return $processMap;
         } finally {
-            self::$building = false;
-            self::$connectionInodes = null;
+            closedir($procDir);
         }
+        
+        $duration = time() - self::$scanStartTime;
+        Logger::info(sprintf("Built process map with %d entries in %ds", count($processMap), $duration));
+        return $processMap;
     }
     
     private static function extractInodesFromProcNet(): array {
         $inodes = [];
+        $maxInodes = Config::get('max_inodes_to_scan', 100000);
         $files = ['/proc/net/tcp', '/proc/net/tcp6', '/proc/net/udp', '/proc/net/udp6'];
         
         foreach ($files as $file) {
+            if (count($inodes) >= $maxInodes) {
+                Logger::warning("Reached maximum inode scan limit of $maxInodes");
+                break;
+            }
+            
             if (!Security::validatePath($file)) {
                 continue;
             }
@@ -759,7 +793,10 @@ final class ProcessCache {
                     }
                     
                     if (preg_match('/\s+(\d+)$/', $line, $matches)) {
-                        $inodes[$matches[1]] = true;
+                        $inodes[] = (int)$matches[1];
+                        if (count($inodes) >= $maxInodes) {
+                            break;
+                        }
                     }
                     PerformanceTracker::recordOperation('inode_extraction');
                 }
@@ -773,6 +810,8 @@ final class ProcessCache {
             }
         }
         
+        $inodes = array_unique($inodes);
+        sort($inodes);
         return $inodes;
     }
     
@@ -791,8 +830,8 @@ final class ProcessCache {
             $linkPath = $fdPath . '/' . $fd;
             $link = readlink($linkPath);
             if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
-                $inode = $matches[1];
-                if (isset(self::$connectionInodes[$inode])) {
+                $inode = (int)$matches[1];
+                if (in_array($inode, self::$connectionInodes, true)) {
                     $foundInodes[] = $inode;
                     if (count($foundInodes) >= count(self::$connectionInodes)) {
                         break;
@@ -833,6 +872,8 @@ final class ProcessCache {
         self::$hits = 0;
         self::$misses = 0;
         self::$lastScan = 0;
+        self::$building = false;
+        self::$lockAcquired = 0;
     }
     
     public static function disableProcessScan(): void {
@@ -845,7 +886,9 @@ final class ProcessCache {
             'cache_size' => count(self::$cache),
             'hits' => self::$hits,
             'misses' => self::$misses,
-            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0
+            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0,
+            'building' => self::$building,
+            'lock_age' => self::$lockAcquired > 0 ? time() - self::$lockAcquired : 0
         ];
     }
 }
@@ -1029,22 +1072,22 @@ final class ConnectionCache {
             return [];
         }
 
-        $handle = fopen($file, 'r');
-        if ($handle === false) {
-            Logger::debug("Cannot open file: $file");
+        $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
+            Logger::debug("Cannot read file: $file");
             return [];
         }
 
-        $processMap = $includeProcess ? ProcessCache::getProcessMap() : null;
+        array_shift($lines);
 
-        fgets($handle);
+        $processMap = $includeProcess ? ProcessCache::getProcessMap() : null;
 
         $connections = [];
         $lineCount = 0;
         $maxConnections = Config::get('max_connections_per_scan', 50000);
         
         try {
-            while (($line = fgets($handle)) !== false) {
+            foreach ($lines as $line) {
                 $lineCount++;
                 if ($lineCount > $maxConnections) {
                     Logger::warning("Reached max connections limit for $file at line $lineCount");
@@ -1066,8 +1109,6 @@ final class ConnectionCache {
         } catch (Throwable $e) {
             Logger::error("Error reading connections from $file: " . $e->getMessage());
             throw $e;
-        } finally {
-            fclose($handle);
         }
         
         return $connections;
@@ -1601,6 +1642,16 @@ final class ConnectionWatcher {
 
             $connections = $this->monitor->getConnections();
             $currentCount = count($connections);
+            
+            $maxWatchConnections = Config::get('max_watch_connections', 100000);
+            if (count($connections) > $maxWatchConnections) {
+                Logger::warning(sprintf(
+                    "Connection count %d exceeds watch limit %d, truncating",
+                    count($connections),
+                    $maxWatchConnections
+                ));
+                $connections = array_slice($connections, 0, $maxWatchConnections);
+            }
 
             $changes = ConnectionHistory::trackChanges($connections);
             self::displayChanges($changes, $iteration);
@@ -1814,6 +1865,25 @@ final class Exporter {
     }
 }
 
+final class TempFileRegistry {
+    private static array $files = [];
+    
+    public static function register(string $file): void {
+        self::$files[] = $file;
+    }
+    
+    public static function cleanup(): void {
+        foreach (self::$files as $file) {
+            @unlink($file);
+        }
+        self::$files = [];
+    }
+    
+    public static function getRegisteredFiles(): array {
+        return self::$files;
+    }
+}
+
 final class Application {
     public static function run(): void {
         try {
@@ -1921,6 +1991,11 @@ final class Application {
                         echo "  $name: {$timer['total']}s total, {$timer['count']} calls, {$timer['average']}s avg\n";
                     }
                 }
+            }
+            
+            $tempFiles = TempFileRegistry::getRegisteredFiles();
+            if (!empty($tempFiles)) {
+                echo "\nTemporary Files: " . count($tempFiles) . " registered\n";
             }
         }
     }
