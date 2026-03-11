@@ -51,6 +51,9 @@ final class Security
 {
     public static function sanitizeOutput($data): string 
     {
+        if (is_resource($data)) {
+            return '[resource]';
+        }
         if (!is_string($data)) {
             return (string)$data;
         }
@@ -199,6 +202,25 @@ final class Config
         'cache_rebuild_lock_timeout' => 30,
     ];
     
+    public static function validate(): void 
+    {
+        foreach (self::$defaults as $key => $defaultValue) {
+            $value = self::get($key);
+            $expectedType = gettype($defaultValue);
+            $actualType = gettype($value);
+            
+            if ($expectedType !== $actualType) {
+                throw new RuntimeException("Config '$key' validation failed: expected $expectedType, got $actualType");
+            }
+            
+            if (str_contains($key, 'threshold') || str_contains($key, 'max_') || str_contains($key, 'limit')) {
+                if ($value < 0) {
+                    throw new RuntimeException("Config '$key' must be positive");
+                }
+            }
+        }
+    }
+    
     public static function get(string $key, $default = null) 
     {
         $envKey = 'TCP_MONITOR_' . strtoupper($key);
@@ -247,7 +269,14 @@ final class Config
             throw new RuntimeException("Cannot read config file: $file");
         }
         
-        $config = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+        if (version_compare(PHP_VERSION, '7.3.0', '<')) {
+            $config = json_decode($content, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new RuntimeException("Invalid JSON in config file: " . json_last_error_msg());
+            }
+        } else {
+            $config = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+        }
         
         if (!is_array($config)) {
             throw new RuntimeException("Invalid JSON structure in config file");
@@ -522,7 +551,14 @@ final class Logger
         $logContent = implode('', self::$logBuffer);
         
         if (self::$logFile) {
-            if (file_put_contents(self::$logFile, $logContent, FILE_APPEND | LOCK_EX) === false) {
+            $fp = fopen(self::$logFile, 'a');
+            if ($fp) {
+                if (flock($fp, LOCK_EX)) {
+                    fwrite($fp, $logContent);
+                    flock($fp, LOCK_UN);
+                }
+                fclose($fp);
+            } else {
                 fwrite(STDERR, "Failed to write to log file: " . self::$logFile . "\n");
             }
         } else {
@@ -700,6 +736,7 @@ final class ProcessCache
     private static int $misses = 0;
     private static int $lastScan = 0;
     private static int $lockAcquired = 0;
+    private static $lockFp = null;
 
     public static function getProcessMap(): array 
     {
@@ -719,14 +756,18 @@ final class ProcessCache
             }
             
             self::$misses++;
-            self::acquireLock();
-            try {
-                self::$cache = self::buildProcessMap();
-                self::$lastBuild = $now;
-                self::$lastScan = $now;
-                self::enforceCacheLimits();
-            } finally {
-                self::releaseLock();
+            if (self::acquireLock()) {
+                try {
+                    self::$cache = self::buildProcessMap();
+                    self::$lastBuild = $now;
+                    self::$lastScan = $now;
+                    self::enforceCacheLimits();
+                } finally {
+                    self::releaseLock();
+                }
+            } else {
+                Logger::debug("Could not acquire lock, returning existing cache");
+                return self::$cache ?: [];
             }
         } else {
             self::$hits++;
@@ -735,14 +776,25 @@ final class ProcessCache
         return self::$cache;
     }
 
-    private static function acquireLock(): void 
+    private static function acquireLock(): bool 
     {
-        self::$building = true;
-        self::$lockAcquired = time();
+        $lockFile = sys_get_temp_dir() . '/tcp_monitor_process_cache.lock';
+        self::$lockFp = fopen($lockFile, 'c');
+        if (self::$lockFp && flock(self::$lockFp, LOCK_EX | LOCK_NB)) {
+            self::$building = true;
+            self::$lockAcquired = time();
+            return true;
+        }
+        return false;
     }
     
     private static function releaseLock(): void 
     {
+        if (self::$lockFp) {
+            flock(self::$lockFp, LOCK_UN);
+            fclose(self::$lockFp);
+            self::$lockFp = null;
+        }
         self::$building = false;
         self::$lockAcquired = 0;
     }
@@ -788,6 +840,9 @@ final class ProcessCache
                 $foundInodes = self::scanProcessInodes($pid);
                 if (!empty($foundInodes)) {
                     $processName = self::getProcessName($pid);
+                    if ($processName === "PID: $pid" && !is_dir("/proc/$pid")) {
+                        continue;
+                    }
                     foreach ($foundInodes as $inode) {
                         $processMap[$inode] = $processName;
                     }
@@ -833,6 +888,7 @@ final class ProcessCache
             
             PerformanceTracker::startTimer("read_$file");
             
+            $handle = null;
             try {
                 $handle = fopen($file, 'r');
                 if ($handle === false) continue;
@@ -858,7 +914,7 @@ final class ProcessCache
             } catch (Throwable $e) {
                 Logger::error("Error reading $file: " . $e->getMessage());
             } finally {
-                if (isset($handle) && is_resource($handle)) {
+                if ($handle && is_resource($handle)) {
                     fclose($handle);
                 }
                 PerformanceTracker::stopTimer("read_$file");
@@ -880,6 +936,9 @@ final class ProcessCache
         $fds = scandir($fdPath);
         if ($fds === false) return $foundInodes;
         
+        $neededInodes = count(self::$connectionInodes);
+        $foundCount = 0;
+        
         foreach ($fds as $fd) {
             if ($fd === '.' || $fd === '..') continue;
             
@@ -889,7 +948,8 @@ final class ProcessCache
                 $inode = (int)$matches[1];
                 if (in_array($inode, self::$connectionInodes, true)) {
                     $foundInodes[] = $inode;
-                    if (count($foundInodes) >= count(self::$connectionInodes)) {
+                    $foundCount++;
+                    if ($foundCount >= $neededInodes) {
                         break;
                     }
                 }
@@ -933,6 +993,10 @@ final class ProcessCache
         self::$lastScan = 0;
         self::$building = false;
         self::$lockAcquired = 0;
+        if (self::$lockFp) {
+            fclose(self::$lockFp);
+            self::$lockFp = null;
+        }
     }
     
     public static function disableProcessScan(): void 
@@ -1036,6 +1100,10 @@ final class IPUtils
 
     private static function ipv6InCidr(string $ip, string $subnet, int $mask): bool 
     {
+        if ($mask < 0 || $mask > 128) {
+            return false;
+        }
+        
         $ipBin = inet_pton($ip);
         $subnetBin = inet_pton($subnet);
 
@@ -1053,7 +1121,12 @@ final class IPUtils
             return false;
         }
         
-        return ($ipBin & $binMask) === ($subnetBin & $binMask);
+        for ($i = 0; $i < 16; $i++) {
+            if ((ord($ipBin[$i]) & ord($binMask[$i])) !== (ord($subnetBin[$i]) & ord($binMask[$i]))) {
+                return false;
+            }
+        }
+        return true;
     }
 }
 
@@ -1227,6 +1300,7 @@ final class ConnectionCache
     {
         static $processCache = [];
         static $cacheSize = 0;
+        static $maxCacheSize = 10000;
         
         if (isset($processCache[$inode])) {
             return $processCache[$inode];
@@ -1236,9 +1310,9 @@ final class ConnectionCache
         $processCache[$inode] = $process;
         $cacheSize++;
         
-        if ($cacheSize > 10000) {
-            $processCache = [];
-            $cacheSize = 0;
+        if ($cacheSize > $maxCacheSize) {
+            $processCache = array_slice($processCache, -5000, null, true);
+            $cacheSize = count($processCache);
         }
         
         return $process;
@@ -1346,6 +1420,14 @@ final class OutputFormatter
             ];
         } else {
             $output = $connections;
+        }
+
+        if (version_compare(PHP_VERSION, '7.3.0', '<')) {
+            $json = json_encode($output, JSON_PRETTY_PRINT);
+            if ($json === false) {
+                throw new RuntimeException("Failed to encode JSON: " . json_last_error_msg());
+            }
+            return $json . "\n";
         }
 
         return json_encode($output, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR) . "\n";
@@ -1818,6 +1900,7 @@ final class OptionParser
 {
     public static function parse(array $argv): array 
     {
+        global $argv;
         $script = basename($argv[0] ?? 'tcp_monitor.php');
         
         $options = getopt("jlpv", [
@@ -1854,6 +1937,7 @@ final class OptionParser
         }
         
         Config::loadFromEnv();
+        Config::validate();
         Logger::setLogLevel(Config::get('log_level', 'INFO'));
     }
     
@@ -2003,6 +2087,11 @@ final class Application
     public static function run(): void 
     {
         try {
+            if (version_compare(PHP_VERSION, '7.3.0', '<')) {
+                fwrite(STDERR, "PHP 7.3 or higher is required for JSON_THROW_ON_ERROR\n");
+                exit(1);
+            }
+
             PerformanceTracker::start();
 
             if (php_sapi_name() !== 'cli') {
