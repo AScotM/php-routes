@@ -47,6 +47,8 @@ const COLORS = [
     'reset' => "\033[0m"
 ];
 
+class SecurityException extends RuntimeException {}
+
 final class Security 
 {
     public static function sanitizeOutput($data): string 
@@ -113,10 +115,15 @@ final class Security
         $result = [];
         
         foreach ($parts as $part) {
-            if ($part === '' || $part === '.') continue;
+            if ($part === '' || $part === '.') {
+                continue;
+            }
             if ($part === '..') {
-                if (empty($result) || end($result) === 'proc') {
+                if (empty($result)) {
                     continue;
+                }
+                if (end($result) === 'proc') {
+                    throw new SecurityException("Path traversal attempt detected in: $path");
                 }
                 array_pop($result);
                 continue;
@@ -200,6 +207,7 @@ final class Config
         'max_inodes_to_scan' => 100000,
         'max_watch_connections' => 100000,
         'cache_rebuild_lock_timeout' => 30,
+        'process_cache_cleanup_interval' => 300,
     ];
     
     public static function validate(): void 
@@ -269,7 +277,7 @@ final class Config
             throw new RuntimeException("Cannot read config file: $file");
         }
         
-        if (version_compare(PHP_VERSION, '7.3.0', '<')) {
+        if (PHP_VERSION_ID < 70300) {
             $config = json_decode($content, true);
             if (json_last_error() !== JSON_ERROR_NONE) {
                 throw new RuntimeException("Invalid JSON in config file: " . json_last_error_msg());
@@ -737,6 +745,7 @@ final class ProcessCache
     private static int $lastScan = 0;
     private static int $lockAcquired = 0;
     private static $lockFp = null;
+    private static int $lastCleanup = 0;
 
     public static function getProcessMap(): array 
     {
@@ -744,6 +753,8 @@ final class ProcessCache
         $ttl = Config::get('process_cache_ttl', 5);
         $scanCooldown = Config::get('process_scan_cooldown', 2);
         $lockTimeout = Config::get('cache_rebuild_lock_timeout', 30);
+        
+        self::cleanupProcessCache();
         
         if (empty(self::$cache) || ($now - self::$lastBuild) > $ttl) {
             if ($now - self::$lastScan < $scanCooldown) {
@@ -755,8 +766,12 @@ final class ProcessCache
                 return self::$cache ?: [];
             }
             
+            if (self::isLockStale($lockTimeout)) {
+                self::releaseLock();
+            }
+            
             self::$misses++;
-            if (self::acquireLock()) {
+            if (self::acquireLock($lockTimeout)) {
                 try {
                     self::$cache = self::buildProcessMap();
                     self::$lastBuild = $now;
@@ -775,16 +790,60 @@ final class ProcessCache
         
         return self::$cache;
     }
+    
+    private static function cleanupProcessCache(): void 
+    {
+        $now = time();
+        $cleanupInterval = Config::get('process_cache_cleanup_interval', 300);
+        
+        if ($now - self::$lastCleanup < $cleanupInterval) {
+            return;
+        }
+        
+        $maxCacheEntries = Config::get('max_cache_entries', 10000);
+        if (count(self::$cache) > $maxCacheEntries) {
+            self::$cache = array_slice(self::$cache, -$maxCacheEntries, null, true);
+            Logger::info("Process cache trimmed to $maxCacheEntries entries");
+        }
+        
+        self::$lastCleanup = $now;
+    }
 
-    private static function acquireLock(): bool 
+    private static function isLockStale(int $lockTimeout): bool 
+    {
+        if (!self::$lockFp) {
+            return false;
+        }
+        
+        $lockFile = sys_get_temp_dir() . '/tcp_monitor_process_cache.lock';
+        if (!file_exists($lockFile)) {
+            return false;
+        }
+        
+        $lockAge = time() - filemtime($lockFile);
+        return $lockAge > $lockTimeout;
+    }
+
+    private static function acquireLock(int $lockTimeout): bool 
     {
         $lockFile = sys_get_temp_dir() . '/tcp_monitor_process_cache.lock';
         self::$lockFp = fopen($lockFile, 'c');
-        if (self::$lockFp && flock(self::$lockFp, LOCK_EX | LOCK_NB)) {
+        
+        if (!self::$lockFp) {
+            return false;
+        }
+        
+        if (flock(self::$lockFp, LOCK_EX | LOCK_NB)) {
             self::$building = true;
             self::$lockAcquired = time();
             return true;
         }
+        
+        if (self::isLockStale($lockTimeout)) {
+            flock(self::$lockFp, LOCK_UN);
+            return self::acquireLock($lockTimeout);
+        }
+        
         return false;
     }
     
@@ -1026,6 +1085,10 @@ final class IPUtils
         if (strlen($hex) !== IPV4_HEX_LENGTH) {
             return '0.0.0.0';
         }
+        
+        if (!ctype_xdigit($hex) || strlen($hex) !== IPV4_HEX_LENGTH) {
+            return '0.0.0.0';
+        }
 
         $parts = [];
         for ($i = 0; $i < IPV4_HEX_LENGTH; $i += 2) {
@@ -1042,7 +1105,7 @@ final class IPUtils
             return '::';
         }
 
-        if (!ctype_xdigit($hex) || strlen($hex) !== 32) {
+        if (!ctype_xdigit($hex) || strlen($hex) !== IPV6_HEX_LENGTH) {
             return '::';
         }
 
@@ -1051,7 +1114,7 @@ final class IPUtils
         $reordered = implode('', $blocks);
         
         $packed = pack('H*', $reordered);
-        if ($packed === false) {
+        if ($packed === false || strlen($packed) !== 16) {
             return '::';
         }
         
@@ -1117,7 +1180,7 @@ final class IPUtils
         }
         $binMask = str_pad($binMask, 32, '0');
         $binMask = pack('H*', $binMask);
-        if ($binMask === false) {
+        if ($binMask === false || strlen($binMask) !== 16) {
             return false;
         }
         
@@ -1135,6 +1198,9 @@ final class ConnectionCache
     private static array $cache = [];
     private static int $hits = 0;
     private static int $misses = 0;
+    private static array $processCache = [];
+    private static int $processCacheSize = 0;
+    private static int $lastProcessCacheCleanup = 0;
     
     public static function getConnections(string $file, int $family, bool $includeProcess = false): array 
     {
@@ -1211,7 +1277,8 @@ final class ConnectionCache
 
         $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
         if ($lines === false) {
-            Logger::debug("Cannot read file: $file");
+            $error = error_get_last();
+            Logger::debug("Cannot read file $file: " . ($error['message'] ?? 'Unknown error'));
             return [];
         }
 
@@ -1298,22 +1365,25 @@ final class ConnectionCache
     
     private static function getProcessByInode(string $inode, array $processMap): string 
     {
-        static $processCache = [];
-        static $cacheSize = 0;
-        static $maxCacheSize = 10000;
+        $now = time();
+        $cleanupInterval = Config::get('process_cache_cleanup_interval', 300);
         
-        if (isset($processCache[$inode])) {
-            return $processCache[$inode];
+        if ($now - self::$lastProcessCacheCleanup > $cleanupInterval) {
+            $maxCacheSize = Config::get('max_cache_entries', 10000);
+            if (self::$processCacheSize > $maxCacheSize) {
+                self::$processCache = array_slice(self::$processCache, -$maxCacheSize, null, true);
+                self::$processCacheSize = count(self::$processCache);
+            }
+            self::$lastProcessCacheCleanup = $now;
+        }
+        
+        if (isset(self::$processCache[$inode])) {
+            return self::$processCache[$inode];
         }
         
         $process = $processMap[$inode] ?? '[unknown]';
-        $processCache[$inode] = $process;
-        $cacheSize++;
-        
-        if ($cacheSize > $maxCacheSize) {
-            $processCache = array_slice($processCache, -5000, null, true);
-            $cacheSize = count($processCache);
-        }
+        self::$processCache[$inode] = $process;
+        self::$processCacheSize++;
         
         return $process;
     }
@@ -1341,6 +1411,8 @@ final class ConnectionCache
         self::$cache = [];
         self::$hits = 0;
         self::$misses = 0;
+        self::$processCache = [];
+        self::$processCacheSize = 0;
     }
     
     public static function getStats(): array 
@@ -1350,7 +1422,8 @@ final class ConnectionCache
             'cache_entries' => count(self::$cache),
             'hits' => self::$hits,
             'misses' => self::$misses,
-            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0
+            'hit_rate' => $total > 0 ? round(self::$hits / $total * 100, 2) : 0,
+            'process_cache_entries' => self::$processCacheSize
         ];
     }
 }
@@ -1364,18 +1437,19 @@ final class OutputFormatter
         }
 
         self::sortConnections($connections);
-        $output = "\nACTIVE TCP CONNECTIONS:\n";
+        $outputLines = [];
+        $outputLines[] = "\nACTIVE TCP CONNECTIONS:\n";
 
         if ($showProcess) {
-            $output .= sprintf("%-5s %-15s %-25s %-25s %-30s\n", 
+            $outputLines[] = sprintf("%-5s %-15s %-25s %-25s %-30s\n", 
                 "Proto", "State", "Local Address", "Remote Address", "Process");
-            $output .= str_repeat("-", 105) . "\n";
+            $outputLines[] = str_repeat("-", 105) . "\n";
             
             foreach ($connections as $c) {
                 $color = self::getStateColor($c['state']);
                 $reset = COLORS['reset'];
                 $process = $c['process'] ?: '[unknown]';
-                $output .= sprintf(
+                $outputLines[] = sprintf(
                     "%-5s {$color}%-15s{$reset} %-25s %-25s %-30s\n",
                     $c['proto'],
                     $c['state'],
@@ -1385,14 +1459,14 @@ final class OutputFormatter
                 );
             }
         } else {
-            $output .= sprintf("%-5s %-15s %-25s %-25s\n", 
+            $outputLines[] = sprintf("%-5s %-15s %-25s %-25s\n", 
                 "Proto", "State", "Local Address", "Remote Address");
-            $output .= str_repeat("-", 75) . "\n";
+            $outputLines[] = str_repeat("-", 75) . "\n";
             
             foreach ($connections as $c) {
                 $color = self::getStateColor($c['state']);
                 $reset = COLORS['reset'];
-                $output .= sprintf(
+                $outputLines[] = sprintf(
                     "%-5s {$color}%-15s{$reset} %-25s %-25s\n",
                     $c['proto'],
                     $c['state'],
@@ -1403,8 +1477,8 @@ final class OutputFormatter
         }
 
         $stats = self::getConnectionStats($connections);
-        $output .= self::formatSummary($stats);
-        return $output;
+        $outputLines[] = self::formatSummary($stats);
+        return implode('', $outputLines);
     }
 
     public static function formatJson(array $connections, bool $includeStats = false): string 
@@ -1422,7 +1496,7 @@ final class OutputFormatter
             $output = $connections;
         }
 
-        if (version_compare(PHP_VERSION, '7.3.0', '<')) {
+        if (PHP_VERSION_ID < 70300) {
             $json = json_encode($output, JSON_PRETTY_PRINT);
             if ($json === false) {
                 throw new RuntimeException("Failed to encode JSON: " . json_last_error_msg());
@@ -1439,10 +1513,10 @@ final class OutputFormatter
             return "";
         }
         
-        $output = "Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode\n";
+        $outputLines = ["Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode\n"];
         
         foreach ($connections as $conn) {
-            $output .= sprintf(
+            $outputLines[] = sprintf(
                 "%s,%s,%s,%d,%s,%d,%s,%s\n",
                 $conn['proto'],
                 $conn['state'],
@@ -1455,42 +1529,43 @@ final class OutputFormatter
             );
         }
         
-        return $output;
+        return implode('', $outputLines);
     }
 
     public static function formatStatistics(array $connections): string 
     {
         $stats = self::getConnectionStats($connections);
-        $output = "\nDETAILED TCP CONNECTION STATISTICS\n";
-        $output .= str_repeat("=", 50) . "\n";
-        $output .= "Generated at: " . $stats['timestamp'] . "\n";
-        $output .= "Total connections: " . $stats['total'] . "\n";
-        $output .= "IPv4 connections: " . $stats['ipv4'] . "\n";
-        $output .= "IPv6 connections: " . $stats['ipv6'] . "\n\n";
+        $outputLines = [];
+        $outputLines[] = "\nDETAILED TCP CONNECTION STATISTICS\n";
+        $outputLines[] = str_repeat("=", 50) . "\n";
+        $outputLines[] = "Generated at: " . $stats['timestamp'] . "\n";
+        $outputLines[] = "Total connections: " . $stats['total'] . "\n";
+        $outputLines[] = "IPv4 connections: " . $stats['ipv4'] . "\n";
+        $outputLines[] = "IPv6 connections: " . $stats['ipv6'] . "\n\n";
 
-        $output .= "Connections by State:\n";
-        $output .= str_repeat("-", 30) . "\n";
+        $outputLines[] = "Connections by State:\n";
+        $outputLines[] = str_repeat("-", 30) . "\n";
         foreach ($stats['by_state'] as $state => $count) {
             $color = self::getStateColor($state);
             $reset = COLORS['reset'];
-            $output .= sprintf("{$color}%-20s{$reset}: %d\n", $state, $count);
+            $outputLines[] = sprintf("{$color}%-20s{$reset}: %d\n", $state, $count);
         }
 
         if (!empty($stats['by_process'])) {
-            $output .= "\nConnections by Process (Top 10):\n";
-            $output .= str_repeat("-", 50) . "\n";
+            $outputLines[] = "\nConnections by Process (Top 10):\n";
+            $outputLines[] = str_repeat("-", 50) . "\n";
 
             uasort($stats['by_process'], fn($a, $b) => $b <=> $a);
 
             $count = 0;
             foreach ($stats['by_process'] as $process => $connCount) {
                 if (empty($process) || $process === '[unknown]') continue;
-                $output .= sprintf("%-40s: %d\n", $process, $connCount);
+                $outputLines[] = sprintf("%-40s: %d\n", $process, $connCount);
                 if (++$count >= 10) break;
             }
         }
         
-        return $output;
+        return implode('', $outputLines);
     }
 
     public static function getConnectionStats(array $connections): array 
@@ -1634,6 +1709,7 @@ final class ConnectionFilter
 final class ConnectionHistory 
 {
     private static array $history = [];
+    private static array $lastKeys = [];
 
     public static function trackChanges(array $current): array 
     {
@@ -1644,15 +1720,15 @@ final class ConnectionHistory
             'removed' => []
         ];
 
-        if (!empty(self::$history)) {
-            $previous = end(self::$history);
+        if (!empty(self::$lastKeys)) {
             $currentKeys = array_map('self::getConnectionKey', $current);
-            $previousKeys = array_map('self::getConnectionKey', $previous['connections']);
             
-            $changes['added'] = array_diff($currentKeys, $previousKeys);
-            $changes['removed'] = array_diff($previousKeys, $currentKeys);
+            $changes['added'] = array_values(array_diff($currentKeys, self::$lastKeys));
+            $changes['removed'] = array_values(array_diff(self::$lastKeys, $currentKeys));
         }
 
+        self::$lastKeys = array_map('self::getConnectionKey', $current);
+        
         self::$history[] = ['connections' => $current, 'changes' => $changes];
         
         $maxHistory = Config::get('max_history', 1000);
@@ -1677,6 +1753,7 @@ final class ConnectionHistory
     public static function clearHistory(): void 
     {
         self::$history = [];
+        self::$lastKeys = [];
     }
     
     public static function getHistoryStats(): array 
@@ -1695,7 +1772,7 @@ final class ConnectionHistory
 
 final class SignalHandler 
 {
-    private static bool $shouldExit = false;
+    private static ?int $pendingSignal = null;
     private static int $startTime;
     private static bool $initialized = false;
 
@@ -1725,10 +1802,21 @@ final class SignalHandler
 
     public static function handleSignal(int $signo): void 
     {
+        self::$pendingSignal = $signo;
+    }
+
+    public static function processPendingSignals(): void 
+    {
+        if (self::$pendingSignal === null) {
+            return;
+        }
+        
+        $signo = self::$pendingSignal;
+        self::$pendingSignal = null;
+        
         switch ($signo) {
             case SIGINT:
             case SIGTERM:
-                self::$shouldExit = true;
                 $duration = time() - self::$startTime;
                 echo "\n\nMonitoring stopped after {$duration} seconds.\n";
                 Logger::info("Received signal $signo, shutting down after $duration seconds");
@@ -1753,12 +1841,13 @@ final class SignalHandler
         if (extension_loaded('pcntl')) {
             pcntl_signal_dispatch();
         }
-        return self::$shouldExit;
+        self::processPendingSignals();
+        return self::$pendingSignal === SIGINT || self::$pendingSignal === SIGTERM;
     }
     
     public static function reset(): void 
     {
-        self::$shouldExit = false;
+        self::$pendingSignal = null;
         self::$initialized = false;
     }
 }
@@ -1811,7 +1900,6 @@ final class ConnectionWatcher
     
     public function watch(array $options, int $interval = 2): void 
     {
-        $lastConnections = [];
         $iteration = 0;
 
         SignalHandler::init();
@@ -1847,8 +1935,6 @@ final class ConnectionWatcher
             } else {
                 echo OutputFormatter::formatTable($connections, $options['processes'] ?? false);
             }
-
-            $lastConnections = $connections;
 
             $slept = 0;
             while ($slept < $interval && !SignalHandler::shouldExit()) {
@@ -2087,8 +2173,8 @@ final class Application
     public static function run(): void 
     {
         try {
-            if (version_compare(PHP_VERSION, '7.3.0', '<')) {
-                fwrite(STDERR, "PHP 7.3 or higher is required for JSON_THROW_ON_ERROR\n");
+            if (PHP_VERSION_ID < 70300) {
+                fwrite(STDERR, "PHP 7.3 or higher is required\n");
                 exit(1);
             }
 
@@ -2185,6 +2271,7 @@ final class Application
             echo "{$processStats['hit_rate']}% hit rate\n";
             echo "  Connection cache: {$connectionStats['cache_entries']} entries, ";
             echo "{$connectionStats['hit_rate']}% hit rate\n";
+            echo "  Process inode cache: {$connectionStats['process_cache_entries']} entries\n";
             
             echo "\nHistory Stats:\n";
             echo "  History size: {$historyStats['history_size']}\n";
