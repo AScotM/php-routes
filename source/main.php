@@ -277,17 +277,15 @@ final class Config
             throw new RuntimeException("Cannot read config file: $file");
         }
         
-        if (PHP_VERSION_ID < 70300) {
-            $config = json_decode($content, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                throw new RuntimeException("Invalid JSON in config file: " . json_last_error_msg());
-            }
-        } else {
-            $config = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        }
+        $config = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
         
         if (!is_array($config)) {
             throw new RuntimeException("Invalid JSON structure in config file");
+        }
+        
+        if (empty($config)) {
+            Logger::warning("Config file is empty or contains no valid settings");
+            return;
         }
         
         foreach ($config as $key => $value) {
@@ -867,9 +865,10 @@ final class ProcessCache
         Security::validateProcFilesystem();
         
         $processMap = [];
-        self::$connectionInodes = self::extractInodesFromProcNet();
+        $inodesList = self::extractInodesFromProcNet();
+        self::$connectionInodes = $inodesList;
         
-        if (empty(self::$connectionInodes)) {
+        if (empty($inodesList)) {
             Logger::info("No inodes found in /proc/net files");
             return $processMap;
         }
@@ -906,7 +905,7 @@ final class ProcessCache
                         $processMap[$inode] = $processName;
                     }
                     
-                    if (count($processMap) >= count(self::$connectionInodes)) {
+                    if (count($processMap) >= count($inodesList)) {
                         Logger::debug("Found all inodes, stopping scan early");
                         break;
                     }
@@ -987,6 +986,10 @@ final class ProcessCache
     
     private static function scanProcessInodes(int $pid): array 
     {
+        if (self::$connectionInodes === null) {
+            return [];
+        }
+        
         $foundInodes = [];
         $fdPath = "/proc/{$pid}/fd";
         
@@ -1259,6 +1262,7 @@ final class ConnectionCache
         $mtime = @filemtime($file);
         $size = @filesize($file);
         if ($mtime === false || $size === false) {
+            Logger::debug("Cannot get file metadata for: $file");
             return null;
         }
         
@@ -1278,7 +1282,7 @@ final class ConnectionCache
         $lines = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
         if ($lines === false) {
             $error = error_get_last();
-            Logger::debug("Cannot read file $file: " . ($error['message'] ?? 'Unknown error'));
+            Logger::error("Failed to read $file: " . ($error['message'] ?? 'Unknown error'));
             return [];
         }
 
@@ -1496,14 +1500,6 @@ final class OutputFormatter
             $output = $connections;
         }
 
-        if (PHP_VERSION_ID < 70300) {
-            $json = json_encode($output, JSON_PRETTY_PRINT);
-            if ($json === false) {
-                throw new RuntimeException("Failed to encode JSON: " . json_last_error_msg());
-            }
-            return $json . "\n";
-        }
-
         return json_encode($output, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR) . "\n";
     }
 
@@ -1591,6 +1587,11 @@ final class OutputFormatter
             if (!empty($conn['process'])) {
                 $stats['by_process'][$conn['process']] = ($stats['by_process'][$conn['process']] ?? 0) + 1;
             }
+        }
+
+        if ($stats['total'] > 0) {
+            $stats['ipv4_percent'] = round(($stats['ipv4'] / $stats['total']) * 100, 2);
+            $stats['ipv6_percent'] = round(($stats['ipv6'] / $stats['total']) * 100, 2);
         }
 
         return $stats;
@@ -1750,6 +1751,14 @@ final class ConnectionHistory
         );
     }
     
+    public static function cleanupOldHistory(int $maxAge = 3600): void 
+    {
+        $now = time();
+        self::$history = array_filter(self::$history, function($entry) use ($now, $maxAge) {
+            return ($now - $entry['changes']['timestamp']) <= $maxAge;
+        });
+    }
+    
     public static function clearHistory(): void 
     {
         self::$history = [];
@@ -1775,6 +1784,7 @@ final class SignalHandler
     private static ?int $pendingSignal = null;
     private static int $startTime;
     private static bool $initialized = false;
+    private static bool $shouldExit = false;
 
     public static function init(): void 
     {
@@ -1802,6 +1812,9 @@ final class SignalHandler
 
     public static function handleSignal(int $signo): void 
     {
+        if ($signo === SIGINT || $signo === SIGTERM) {
+            self::$shouldExit = true;
+        }
         self::$pendingSignal = $signo;
     }
 
@@ -1842,13 +1855,14 @@ final class SignalHandler
             pcntl_signal_dispatch();
         }
         self::processPendingSignals();
-        return self::$pendingSignal === SIGINT || self::$pendingSignal === SIGTERM;
+        return self::$shouldExit;
     }
     
     public static function reset(): void 
     {
         self::$pendingSignal = null;
         self::$initialized = false;
+        self::$shouldExit = false;
     }
 }
 
