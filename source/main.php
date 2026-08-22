@@ -56,10 +56,9 @@ final class Security
         if (is_resource($data)) {
             return '[resource]';
         }
-        if (!is_string($data)) {
-            return (string)$data;
-        }
-        return htmlspecialchars($data, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML5, 'UTF-8');
+
+        $value = is_string($data) ? $data : (string)$data;
+        return preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '?', $value) ?? '';
     }
     
     public static function validatePath(string $path): bool 
@@ -147,19 +146,19 @@ final class Security
     
     public static function validateInteger($value, ?int $min = null, ?int $max = null): int 
     {
-        if (!is_numeric($value)) {
-            throw new InvalidArgumentException("Value must be numeric");
+        $validated = filter_var($value, FILTER_VALIDATE_INT);
+        if ($validated === false) {
+            throw new InvalidArgumentException("Value must be an integer");
         }
-        
-        $intVal = (int)$value;
-        if ($min !== null && $intVal < $min) {
+
+        if ($min !== null && $validated < $min) {
             throw new InvalidArgumentException("Value must be at least $min");
         }
-        if ($max !== null && $intVal > $max) {
+        if ($max !== null && $validated > $max) {
             throw new InvalidArgumentException("Value must be at most $max");
         }
-        
-        return $intVal;
+
+        return $validated;
     }
     
     public static function validatePid(int $pid): bool 
@@ -738,6 +737,7 @@ final class ProcessCache
     private static int $scanStartTime = 0;
     private static bool $building = false;
     private static ?array $connectionInodes = null;
+    private static ?array $connectionInodeSet = null;
     private static int $hits = 0;
     private static int $misses = 0;
     private static int $lastScan = 0;
@@ -867,7 +867,8 @@ final class ProcessCache
         $processMap = [];
         $inodesList = self::extractInodesFromProcNet();
         self::$connectionInodes = $inodesList;
-        
+        self::$connectionInodeSet = array_fill_keys($inodesList, true);
+
         if (empty($inodesList)) {
             Logger::info("No inodes found in /proc/net files");
             return $processMap;
@@ -961,8 +962,9 @@ final class ProcessCache
                         break;
                     }
                     
-                    if (preg_match('/\s+(\d+)$/', $line, $matches)) {
-                        $inodes[] = (int)$matches[1];
+                    $fields = preg_split('/\s+/', trim($line));
+                    if (isset($fields[9]) && ctype_digit($fields[9])) {
+                        $inodes[] = (int)$fields[9];
                         if (count($inodes) >= $maxInodes) {
                             break;
                         }
@@ -986,39 +988,38 @@ final class ProcessCache
     
     private static function scanProcessInodes(int $pid): array 
     {
-        if (self::$connectionInodes === null) {
+        if (self::$connectionInodeSet === null || self::$connectionInodeSet === []) {
             return [];
         }
-        
+
         $foundInodes = [];
         $fdPath = "/proc/{$pid}/fd";
-        
-        if (!is_dir($fdPath)) return $foundInodes;
+
+        if (!is_dir($fdPath)) {
+            return $foundInodes;
+        }
 
         $fds = scandir($fdPath);
-        if ($fds === false) return $foundInodes;
-        
-        $neededInodes = count(self::$connectionInodes);
-        $foundCount = 0;
-        
+        if ($fds === false) {
+            return $foundInodes;
+        }
+
         foreach ($fds as $fd) {
-            if ($fd === '.' || $fd === '..') continue;
-            
-            $linkPath = $fdPath . '/' . $fd;
-            $link = @readlink($linkPath);
-            if ($link && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
+            if ($fd === '.' || $fd === '..') {
+                continue;
+            }
+
+            $link = @readlink($fdPath . '/' . $fd);
+            if ($link !== false && preg_match('/socket:\[(\d+)\]/', $link, $matches)) {
                 $inode = (int)$matches[1];
-                if (in_array($inode, self::$connectionInodes, true)) {
+                if (isset(self::$connectionInodeSet[$inode])) {
                     $foundInodes[] = $inode;
-                    $foundCount++;
-                    if ($foundCount >= $neededInodes) {
-                        break;
-                    }
                 }
             }
+
             PerformanceTracker::recordOperation('fd_scan');
         }
-        
+
         return $foundInodes;
     }
     
@@ -1055,6 +1056,8 @@ final class ProcessCache
         self::$lastScan = 0;
         self::$building = false;
         self::$lockAcquired = 0;
+        self::$connectionInodes = null;
+        self::$connectionInodeSet = null;
         if (self::$lockFp) {
             fclose(self::$lockFp);
             self::$lockFp = null;
@@ -1084,12 +1087,7 @@ final class IPUtils
 {
     public static function hexToIpv4(string $hex): string 
     {
-        $hex = preg_replace('/[^0-9A-Fa-f]/', '', $hex);
-        if (strlen($hex) !== IPV4_HEX_LENGTH) {
-            return '0.0.0.0';
-        }
-        
-        if (!ctype_xdigit($hex) || strlen($hex) !== IPV4_HEX_LENGTH) {
+        if (strlen($hex) !== IPV4_HEX_LENGTH || !ctype_xdigit($hex)) {
             return '0.0.0.0';
         }
 
@@ -1103,26 +1101,22 @@ final class IPUtils
 
     public static function hexToIpv6(string $hex): string 
     {
-        $hex = preg_replace('/[^0-9A-Fa-f]/', '', $hex);
-        if (strlen($hex) !== IPV6_HEX_LENGTH) {
+        if (strlen($hex) !== IPV6_HEX_LENGTH || !ctype_xdigit($hex)) {
             return '::';
         }
 
-        if (!ctype_xdigit($hex) || strlen($hex) !== IPV6_HEX_LENGTH) {
-            return '::';
+        $networkHex = '';
+        foreach (str_split($hex, 8) as $word) {
+            $networkHex .= implode('', array_reverse(str_split($word, 2)));
         }
 
-        $blocks = str_split($hex, 8);
-        $blocks = array_reverse($blocks);
-        $reordered = implode('', $blocks);
-        
-        $packed = pack('H*', $reordered);
+        $packed = pack('H*', $networkHex);
         if ($packed === false || strlen($packed) !== 16) {
             return '::';
         }
-        
-        $addr = inet_ntop($packed);
-        return $addr ?: '::';
+
+        $address = inet_ntop($packed);
+        return $address !== false ? $address : '::';
     }
 
     public static function ipInCidr(string $ip, string $cidr): bool 
@@ -1152,16 +1146,25 @@ final class IPUtils
 
     private static function ipv4InCidr(string $ip, string $subnet, int $mask): bool 
     {
-        if ($mask === 0) return true;
-        if ($mask >= 32) return $ip === $subnet;
+        if ($mask < 0 || $mask > 32) {
+            return false;
+        }
 
         $ipLong = ip2long($ip);
         $subnetLong = ip2long($subnet);
+        if ($ipLong === false || $subnetLong === false) {
+            return false;
+        }
 
-        if ($ipLong === false || $subnetLong === false) return false;
+        if ($mask === 0) {
+            return true;
+        }
+        if ($mask === 32) {
+            return $ipLong === $subnetLong;
+        }
 
-        $maskLong = ($mask === 0) ? 0 : ((0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF);
-        return (($ipLong & $maskLong) === ($subnetLong & $maskLong));
+        $maskLong = (0xFFFFFFFF << (32 - $mask)) & 0xFFFFFFFF;
+        return ($ipLong & $maskLong) === ($subnetLong & $maskLong);
     }
 
     private static function ipv6InCidr(string $ip, string $subnet, int $mask): bool 
@@ -1173,9 +1176,15 @@ final class IPUtils
         $ipBin = inet_pton($ip);
         $subnetBin = inet_pton($subnet);
 
-        if ($ipBin === false || $subnetBin === false) return false;
-        if ($mask === 0) return true;
-        if ($mask >= 128) return $ip === $subnet;
+        if ($ipBin === false || $subnetBin === false) {
+            return false;
+        }
+        if ($mask === 0) {
+            return true;
+        }
+        if ($mask === 128) {
+            return hash_equals($ipBin, $subnetBin);
+        }
 
         $binMask = str_repeat('f', intdiv($mask, 4));
         if ($mask % 4) {
@@ -1674,11 +1683,12 @@ final class ConnectionFilter
                 self::ipMatchesFilter($c['remote_ip'], $remoteIp));
         }
 
-        if (isset($options['ipv4'])) {
-            $filtered = array_filter($filtered, fn($c) => $c['proto'] === 'IPv4');
-        }
+        $ipv4Only = isset($options['ipv4']) && !isset($options['ipv6']);
+        $ipv6Only = isset($options['ipv6']) && !isset($options['ipv4']);
 
-        if (isset($options['ipv6'])) {
+        if ($ipv4Only) {
+            $filtered = array_filter($filtered, fn($c) => $c['proto'] === 'IPv4');
+        } elseif ($ipv6Only) {
             $filtered = array_filter($filtered, fn($c) => $c['proto'] === 'IPv6');
         }
 
@@ -1721,16 +1731,19 @@ final class ConnectionHistory
             'removed' => []
         ];
 
+        $currentKeys = array_map('self::getConnectionKey', $current);
+
         if (!empty(self::$lastKeys)) {
-            $currentKeys = array_map('self::getConnectionKey', $current);
-            
             $changes['added'] = array_values(array_diff($currentKeys, self::$lastKeys));
             $changes['removed'] = array_values(array_diff(self::$lastKeys, $currentKeys));
         }
 
-        self::$lastKeys = array_map('self::getConnectionKey', $current);
-        
-        self::$history[] = ['connections' => $current, 'changes' => $changes];
+        self::$lastKeys = $currentKeys;
+
+        self::$history[] = [
+            'connection_count' => count($current),
+            'changes' => $changes
+        ];
         
         $maxHistory = Config::get('max_history', 1000);
         if (count(self::$history) > $maxHistory) {
@@ -1769,7 +1782,7 @@ final class ConnectionHistory
     {
         $totalTracked = 0;
         foreach (self::$history as $entry) {
-            $totalTracked += count($entry['connections']);
+            $totalTracked += $entry['connection_count'];
         }
         
         return [
@@ -1926,28 +1939,36 @@ final class ConnectionWatcher
             echo "\033[2J\033[;H";
 
             $connections = $this->monitor->getConnections();
-            $currentCount = count($connections);
-            
+            $totalCount = count($connections);
             $maxWatchConnections = Config::get('max_watch_connections', 100000);
-            if (count($connections) > $maxWatchConnections) {
+            $truncated = false;
+
+            if ($totalCount > $maxWatchConnections) {
                 Logger::warning(sprintf(
                     "Connection count %d exceeds watch limit %d, truncating",
-                    count($connections),
+                    $totalCount,
                     $maxWatchConnections
                 ));
                 $connections = array_slice($connections, 0, $maxWatchConnections);
+                $truncated = true;
             }
 
             $changes = ConnectionHistory::trackChanges($connections);
             self::displayChanges($changes, $iteration);
 
-            echo "[" . date('H:i:s') . "] Iteration: $iteration | Connections: $currentCount\n";
-            echo str_repeat("-", 60) . "\n";
+            $displayCount = count($connections);
+            echo "[" . date('H:i:s') . "] Iteration: $iteration | Connections: $displayCount";
+            if ($truncated) {
+                echo " | Total detected: $totalCount";
+            }
+            echo "\n" . str_repeat("-", 60) . "\n";
 
-            if (isset($options['json'])) {
-                echo OutputFormatter::formatJson($connections, $options['stats'] ?? false);
+            $output = self::formatOutput($connections, $options);
+            if (isset($options['output'])) {
+                Exporter::toFileWithBackup(OutputFormatter::stripColors($output), $options['output']);
+                echo "Output written to: {$options['output']}\n";
             } else {
-                echo OutputFormatter::formatTable($connections, $options['processes'] ?? false);
+                echo $output;
             }
 
             $slept = 0;
@@ -1956,8 +1977,32 @@ final class ConnectionWatcher
                 $slept++;
             }
 
-            if (SignalHandler::shouldExit()) break;
+            if (SignalHandler::shouldExit()) {
+                break;
+            }
         }
+    }
+
+    private static function formatOutput(array $connections, array $options): string
+    {
+        if (isset($options['count'])) {
+            $stats = OutputFormatter::getConnectionStats($connections);
+            return "Counts: total={$stats['total']} IPv4={$stats['ipv4']} IPv6={$stats['ipv6']}\n";
+        }
+
+        if (isset($options['j']) || isset($options['json'])) {
+            return OutputFormatter::formatJson($connections, isset($options['stats']));
+        }
+
+        if (isset($options['csv'])) {
+            return OutputFormatter::formatCsv($connections);
+        }
+
+        if (isset($options['stats'])) {
+            return OutputFormatter::formatStatistics($connections);
+        }
+
+        return OutputFormatter::formatTable($connections, isset($options['processes']));
     }
     
     private static function displayChanges(array $changes, int $iteration): void 
@@ -2047,9 +2092,10 @@ final class OptionParser
             $options['port'] = InputValidator::validatePort($options['port']);
         }
         
-        if (isset($options['watch']) && $options['watch'] !== false) {
-            $interval = $options['watch'] === false ? 2 : $options['watch'];
-            $options['watch_interval'] = InputValidator::validateInterval($interval);
+        if (isset($options['watch'])) {
+            $options['watch_interval'] = $options['watch'] === false
+                ? Config::get('refresh_interval', 2)
+                : InputValidator::validateInterval($options['watch']);
         }
         
         if (isset($options['local-ip'])) {
@@ -2076,6 +2122,10 @@ final class OptionParser
             Logger::setLogLevel('INFO');
         }
         
+        if (isset($options['processes']) && isset($options['no-processes'])) {
+            throw new InvalidArgumentException("--processes and --no-processes cannot be used together");
+        }
+
         if (isset($options['no-processes'])) {
             ProcessCache::disableProcessScan();
         }
@@ -2146,16 +2196,30 @@ final class Exporter
     
     public static function toFileWithBackup(string $content, string $filename): void 
     {
+        $backup = null;
+
         if (file_exists($filename)) {
             $backup = $filename . '.bak';
-            if (file_exists($backup)) {
-                unlink($backup);
+
+            if (file_exists($backup) && !unlink($backup)) {
+                throw new RuntimeException("Failed to remove existing backup: $backup");
             }
-            rename($filename, $backup);
+
+            if (!rename($filename, $backup)) {
+                throw new RuntimeException("Failed to create backup: $backup");
+            }
+
             Logger::debug("Created backup: $backup");
         }
-        
-        self::toFile($content, $filename);
+
+        try {
+            self::toFile($content, $filename);
+        } catch (Throwable $e) {
+            if ($backup !== null && file_exists($backup) && !file_exists($filename)) {
+                @rename($backup, $filename);
+            }
+            throw $e;
+        }
     }
 }
 
@@ -2187,8 +2251,8 @@ final class Application
     public static function run(): void 
     {
         try {
-            if (PHP_VERSION_ID < 70300) {
-                fwrite(STDERR, "PHP 7.3 or higher is required\n");
+            if (PHP_VERSION_ID < 80000) {
+                fwrite(STDERR, "PHP 8.0 or higher is required\n");
                 exit(1);
             }
 
@@ -2235,20 +2299,18 @@ final class Application
                 exit(0);
             }
 
-            if (isset($options['stats'])) {
-                $output = OutputFormatter::formatStatistics($connections);
-            } elseif (isset($options['j']) || isset($options['json'])) {
-                $output = OutputFormatter::formatJson($connections, $options['stats'] ?? false);
+            if (isset($options['j']) || isset($options['json'])) {
+                $output = OutputFormatter::formatJson($connections, isset($options['stats']));
             } elseif (isset($options['csv'])) {
                 $output = OutputFormatter::formatCsv($connections);
-                if (isset($options['output'])) {
-                    $output = OutputFormatter::stripColors($output);
-                }
+            } elseif (isset($options['stats'])) {
+                $output = OutputFormatter::formatStatistics($connections);
             } else {
-                $output = OutputFormatter::formatTable($connections, $options['processes'] ?? false);
-                if (isset($options['output'])) {
-                    $output = OutputFormatter::stripColors($output);
-                }
+                $output = OutputFormatter::formatTable($connections, isset($options['processes']));
+            }
+
+            if (isset($options['output'])) {
+                $output = OutputFormatter::stripColors($output);
             }
 
             if (isset($options['output'])) {
@@ -2261,7 +2323,7 @@ final class Application
             self::displayPerformanceMetrics($options);
 
         } catch (Throwable $e) {
-            ErrorHandler::handle($e, $options['verbose'] ?? false);
+            ErrorHandler::handle($e, isset($options['verbose']) || isset($options['v']) || isset($options['debug']));
             exit(1);
         }
     }
